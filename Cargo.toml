@@ -2,6 +2,10 @@
 name = "clickr"
 version = "0.1.0"
 edition = "2021"
+authors = ["Fabian"]
+license = "MIT"
+description = "Ultra-lightweight native Win32 autoclicker built in Rust"
+repository = "https://github.com/FabianDream/Clickr"
 
 [dependencies]
 windows-sys = { version = "0.59", features = [
