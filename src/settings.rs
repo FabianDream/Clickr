@@ -190,6 +190,26 @@ pub fn load_settings() -> AppSettings {
         };
     }
 
+    // Safety constraint: Enforce safe CPS limits on loaded rate & interval (max 100 CPS / min 10 ms)
+    let max_rate = match settings.rate_unit {
+        1 => 6000.0,   // 100 CPS * 60 (CPM)
+        2 => 360000.0, // 100 CPS * 3600 (CPH)
+        _ => 100.0,    // 100 CPS
+    };
+    if let Ok(val) = settings.rate.parse::<f64>() {
+        if val > max_rate {
+            settings.rate = format!("{}", max_rate as u64);
+        }
+    }
+
+    if settings.hr == "0" && settings.min == "0" && settings.sec == "0" {
+        if let Ok(ms_val) = settings.ms.parse::<u64>() {
+            if ms_val < 10 {
+                settings.ms = "10".to_string();
+            }
+        }
+    }
+
     settings
 }
 
@@ -223,9 +243,13 @@ pub fn save_settings(settings: &AppSettings) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static FILE_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_save_and_load_roundtrip() {
+        let _guard = FILE_MUTEX.lock().unwrap();
         let original = load_settings();
         let mut test_settings = original.clone();
         test_settings.hotkey = 117; // F6
@@ -270,5 +294,26 @@ mod tests {
             };
         }
         assert_ne!(settings.hotkey, settings.target_key as u32);
+    }
+
+    #[test]
+    fn test_safe_cps_clamping_on_load() {
+        let _guard = FILE_MUTEX.lock().unwrap();
+        let original = load_settings();
+        let mut test_settings = original.clone();
+        test_settings.rate = "500".to_string(); // Exceeds 100 CPS
+        test_settings.rate_unit = 0;           // CPS
+        test_settings.hr = "0".to_string();
+        test_settings.min = "0".to_string();
+        test_settings.sec = "0".to_string();
+        test_settings.ms = "1".to_string();    // Exceeds 100 CPS (1ms < 10ms)
+        save_settings(&test_settings);
+
+        let loaded = load_settings();
+        assert_eq!(loaded.rate, "100");
+        assert_eq!(loaded.ms, "10");
+
+        // Restore original
+        save_settings(&original);
     }
 }

@@ -50,7 +50,7 @@ Fixed-size, compact window (~500x220 px) with clean sections:
    - **`( ) Click Interval`:**
      - Four numeric inputs: `[0] hr`, `[0] min`, `[0] sec`, `[100] ms`.
    - Dynamically swaps between the rate and interval inputs in-place.
-   - Enforces a safe 1 ms minimum delay (up to 1,000 CPS) and handles zero/invalid inputs gracefully.
+   - Enforces a safe maximum click rate of 100 CPS (minimum 10 ms delay) to prevent system slowdowns, Windows message queue exhaustion, and application crashes. Handles zero/invalid inputs gracefully.
 
 3. **Row 2 — Target & Action Type (Mouse & Keyboard Support):**
    - **`Target:` Label:**

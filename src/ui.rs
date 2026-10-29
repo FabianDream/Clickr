@@ -821,7 +821,7 @@ pub unsafe fn create_controls(
         WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE_STYLE,
         12,
         150,
-        54,
+        70,
         24,
         parent,
         null_mut(),
@@ -834,7 +834,7 @@ pub unsafe fn create_controls(
         btn_class.as_ptr(),
         null_mut(),
         WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON_U32 | WS_GROUP | WS_TABSTOP,
-        68,
+        86,
         150,
         18,
         24,
@@ -849,9 +849,9 @@ pub unsafe fn create_controls(
         static_class.as_ptr(),
         to_wide_null("Current").as_ptr(),
         WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE_STYLE | SS_NOTIFY_STYLE,
-        88,
+        106,
         150,
-        55,
+        54,
         24,
         parent,
         ID_LBL_RADIO_LOC_CURRENT as HMENU,
@@ -864,7 +864,7 @@ pub unsafe fn create_controls(
         btn_class.as_ptr(),
         null_mut(),
         WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON_U32 | WS_TABSTOP,
-        152,
+        166,
         150,
         18,
         24,
@@ -879,9 +879,9 @@ pub unsafe fn create_controls(
         static_class.as_ptr(),
         to_wide_null("Specific").as_ptr(),
         WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE_STYLE | SS_NOTIFY_STYLE,
-        172,
+        186,
         150,
-        58,
+        56,
         24,
         parent,
         ID_LBL_RADIO_LOC_SPECIFIC as HMENU,
@@ -894,7 +894,7 @@ pub unsafe fn create_controls(
         static_class.as_ptr(),
         to_wide_null("X:").as_ptr(),
         WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE_STYLE,
-        240,
+        248,
         150,
         16,
         24,
@@ -909,9 +909,9 @@ pub unsafe fn create_controls(
         edit_class.as_ptr(),
         to_wide_null("0").as_ptr(),
         WS_CHILD | WS_VISIBLE | ES_CENTER_U32 | WS_TABSTOP,
-        258,
+        266,
         150,
-        48,
+        46,
         24,
         parent,
         ID_EDIT_LOC_X as HMENU,
@@ -924,7 +924,7 @@ pub unsafe fn create_controls(
         static_class.as_ptr(),
         to_wide_null("Y:").as_ptr(),
         WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE_STYLE,
-        312,
+        318,
         150,
         16,
         24,
@@ -939,9 +939,9 @@ pub unsafe fn create_controls(
         edit_class.as_ptr(),
         to_wide_null("0").as_ptr(),
         WS_CHILD | WS_VISIBLE | ES_CENTER_U32 | WS_TABSTOP,
-        330,
+        336,
         150,
-        48,
+        46,
         24,
         parent,
         ID_EDIT_LOC_Y as HMENU,
@@ -1072,8 +1072,10 @@ pub unsafe fn create_controls(
     add_tooltip(tooltip_hwnd, parent, btn_start, "Start or stop autoclicking (Shortcut: active hotkey)");
     add_tooltip(tooltip_hwnd, parent, btn_hotkeys, "Click to change the global Start/Stop activation hotkey");
     add_tooltip(tooltip_hwnd, parent, combo_trigger_mode, "Start Trigger Mode:\n• Toggle (Hotkey): Press hotkey to start or stop\n• Hold (Hotkey): Autoclicks only while holding hotkey\n• Hold Mouse Click: When enabled, holding mouse click autoclicks");
-    add_tooltip(tooltip_hwnd, parent, radio_rate, "Click Rate: Specify clicks per second, minute, or hour");
-    add_tooltip(tooltip_hwnd, parent, lbl_radio_rate, "Click Rate: Specify clicks per second, minute, or hour");
+    add_tooltip(tooltip_hwnd, parent, radio_rate, "Click Rate: Specify clicks per second, minute, or hour (max safe: 100 CPS)");
+    add_tooltip(tooltip_hwnd, parent, lbl_radio_rate, "Click Rate: Specify clicks per second, minute, or hour (max safe: 100 CPS)");
+    add_tooltip(tooltip_hwnd, parent, edit_rate, "Rate numeric value (Limited to a safe maximum of 100 CPS to prevent app crashes and system slowdowns)");
+    add_tooltip(tooltip_hwnd, parent, edit_ms, "Milliseconds delay (Safe limit: minimum 10 ms / 100 CPS to prevent app crashes)");
     add_tooltip(tooltip_hwnd, parent, radio_interval, "Click Interval: Specify exact delay between clicks (hr, min, sec, ms)");
     add_tooltip(tooltip_hwnd, parent, lbl_radio_interval, "Click Interval: Specify exact delay between clicks (hr, min, sec, ms)");
     add_tooltip(tooltip_hwnd, parent, radio_mouse, "Mouse Target: Simulate mouse button clicks");
@@ -1336,21 +1338,23 @@ pub fn update_location_state(controls: &Controls, input_mode: u32, location_mode
     let flag_inputs = if is_mouse && location_mode == 1 { 1 } else { 0 };
 
     unsafe {
-        EnableWindow(controls.lbl_location, flag_radios);
+        // Only disable interactive radio and edit controls; never disable STATIC label controls
+        // to prevent Windows from applying ugly 3D-embossed font distortion.
         EnableWindow(controls.radio_loc_current, flag_radios);
-        EnableWindow(controls.lbl_radio_loc_current, flag_radios);
         EnableWindow(controls.radio_loc_specific, flag_radios);
-        EnableWindow(controls.lbl_radio_loc_specific, flag_radios);
 
-        EnableWindow(controls.lbl_loc_x, flag_inputs);
         EnableWindow(controls.edit_loc_x, flag_inputs);
-        EnableWindow(controls.lbl_loc_y, flag_inputs);
         EnableWindow(controls.edit_loc_y, flag_inputs);
         EnableWindow(controls.btn_pick_pos, if is_mouse { 1 } else { 0 });
 
         InvalidateRect(controls.edit_loc_x, null_mut(), 1);
         InvalidateRect(controls.edit_loc_y, null_mut(), 1);
         InvalidateRect(controls.btn_pick_pos, null_mut(), 1);
+        InvalidateRect(controls.lbl_location, null_mut(), 1);
+        InvalidateRect(controls.lbl_radio_loc_current, null_mut(), 1);
+        InvalidateRect(controls.lbl_radio_loc_specific, null_mut(), 1);
+        InvalidateRect(controls.lbl_loc_x, null_mut(), 1);
+        InvalidateRect(controls.lbl_loc_y, null_mut(), 1);
     }
 }
 
@@ -1358,14 +1362,13 @@ pub fn set_controls_enabled(controls: &Controls, enabled: bool) {
     let flag = if enabled { 1 } else { 0 };
 
     unsafe {
+        // Interactive buttons and dropdowns
         EnableWindow(controls.btn_hotkeys, flag);
         EnableWindow(controls.combo_trigger_mode, flag);
-        EnableWindow(controls.lbl_timing, flag);
         EnableWindow(controls.radio_interval, flag);
-        EnableWindow(controls.lbl_radio_interval, flag);
         EnableWindow(controls.radio_rate, flag);
-        EnableWindow(controls.lbl_radio_rate, flag);
 
+        // Timing edit and combo inputs
         EnableWindow(controls.edit_hr, flag);
         EnableWindow(controls.edit_min, flag);
         EnableWindow(controls.edit_sec, flag);
@@ -1374,26 +1377,21 @@ pub fn set_controls_enabled(controls: &Controls, enabled: bool) {
         EnableWindow(controls.edit_rate, flag);
         EnableWindow(controls.combo_rate_unit, flag);
 
-        EnableWindow(controls.lbl_buttons, flag);
+        // Target radio and dropdown controls
         EnableWindow(controls.radio_mouse, flag);
-        EnableWindow(controls.lbl_radio_mouse, flag);
         EnableWindow(controls.radio_keyboard, flag);
-        EnableWindow(controls.lbl_radio_keyboard, flag);
         EnableWindow(controls.combo_mouse_btn, flag);
         EnableWindow(controls.combo_click_type, flag);
         EnableWindow(controls.btn_key_target, flag);
 
-        EnableWindow(controls.lbl_location, flag);
+        // Location radio and coordinate inputs
         EnableWindow(controls.radio_loc_current, flag);
-        EnableWindow(controls.lbl_radio_loc_current, flag);
         EnableWindow(controls.radio_loc_specific, flag);
-        EnableWindow(controls.lbl_radio_loc_specific, flag);
-        EnableWindow(controls.lbl_loc_x, flag);
         EnableWindow(controls.edit_loc_x, flag);
-        EnableWindow(controls.lbl_loc_y, flag);
         EnableWindow(controls.edit_loc_y, flag);
         EnableWindow(controls.btn_pick_pos, flag);
 
+        // Amount input
         EnableWindow(controls.edit_amount, flag);
 
         // Invalidate custom-drawn buttons to repaint their disabled/enabled visuals
@@ -1511,6 +1509,51 @@ mod tests {
             assert_eq!(combobox_get_cursel(hwnd), 1);
 
             DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn test_location_controls_no_overlap() {
+        unsafe {
+            let class_name = to_wide_null("STATIC");
+            let hwnd_parent = CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                null_mut(),
+                WS_POPUP,
+                0, 0, 500, 300,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            );
+            assert!(!hwnd_parent.is_null());
+
+            let (font_reg, font_bold) = create_ui_fonts();
+            let hinst = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(null_mut());
+            let controls = create_controls(hwnd_parent, hinst, font_reg, font_bold);
+
+            let mut rc_lbl: RECT = std::mem::zeroed();
+            let mut rc_radio: RECT = std::mem::zeroed();
+            GetWindowRect(controls.lbl_location, &mut rc_lbl);
+            GetWindowRect(controls.radio_loc_current, &mut rc_radio);
+
+            let mut pt_lbl = POINT { x: rc_lbl.right, y: rc_lbl.top };
+            let mut pt_radio = POINT { x: rc_radio.left, y: rc_radio.top };
+            ScreenToClient(hwnd_parent, &mut pt_lbl);
+            ScreenToClient(hwnd_parent, &mut pt_radio);
+
+            // Verify lbl_location ends before radio_loc_current begins (no overlap!)
+            assert!(
+                pt_lbl.x <= pt_radio.x,
+                "Location label right ({}) overlaps with radio left ({})",
+                pt_lbl.x,
+                pt_radio.x
+            );
+
+            DeleteObject(font_reg);
+            DeleteObject(font_bold);
+            DestroyWindow(hwnd_parent);
         }
     }
 }

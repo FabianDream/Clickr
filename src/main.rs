@@ -80,8 +80,27 @@ fn save_current_settings(ctx: &WindowContext) {
     let hr = get_control_text(ctx.controls.edit_hr);
     let min = get_control_text(ctx.controls.edit_min);
     let sec = get_control_text(ctx.controls.edit_sec);
-    let ms = get_control_text(ctx.controls.edit_ms);
-    let rate = get_control_text(ctx.controls.edit_rate);
+    let mut ms = get_control_text(ctx.controls.edit_ms);
+    if hr == "0" && min == "0" && sec == "0" {
+        if let Ok(ms_val) = ms.parse::<u64>() {
+            if ms_val < 10 {
+                ms = "10".to_string();
+            }
+        }
+    }
+
+    let mut rate = get_control_text(ctx.controls.edit_rate);
+    let max_rate = match rate_unit {
+        1 => 6000.0,   // 100 CPS * 60 (CPM)
+        2 => 360000.0, // 100 CPS * 3600 (CPH)
+        _ => 100.0,    // 100 CPS
+    };
+    if let Ok(val) = rate.parse::<f64>() {
+        if val > max_rate {
+            rate = format!("{}", max_rate as u64);
+        }
+    }
+
     let click_amount = get_control_text(ctx.controls.edit_amount);
     let target_x = parse_i32_or_0(&get_control_text(ctx.controls.edit_loc_x));
     let target_y = parse_i32_or_0(&get_control_text(ctx.controls.edit_loc_y));
@@ -136,13 +155,28 @@ fn start_clicker(hwnd: HWND, ctx: &mut WindowContext) {
     let hr = parse_u64_or_0(&get_control_text(ctx.controls.edit_hr));
     let min = parse_u64_or_0(&get_control_text(ctx.controls.edit_min));
     let sec = parse_u64_or_0(&get_control_text(ctx.controls.edit_sec));
-    let ms = parse_u64_or_default(&get_control_text(ctx.controls.edit_ms), 100);
+    let mut ms = parse_u64_or_default(&get_control_text(ctx.controls.edit_ms), 100);
 
-    let rate = parse_f64_or_default(&get_control_text(ctx.controls.edit_rate), 10.0);
+    // Enforce safe minimum delay (10 ms / 100 CPS) in Interval mode
+    if timing_mode == TimingMode::Interval && hr == 0 && min == 0 && sec == 0 && ms < 10 {
+        ms = 10;
+        set_control_text(ctx.controls.edit_ms, "10");
+    }
+
     let rate_unit = match combobox_get_cursel(ctx.controls.combo_rate_unit) {
         1 => RateUnit::PerMinute,
         2 => RateUnit::PerHour,
         _ => RateUnit::PerSecond,
+    };
+
+    let raw_rate = parse_f64_or_default(&get_control_text(ctx.controls.edit_rate), 50.0);
+    // Enforce safe maximum rate (100 CPS) in Rate mode to prevent Windows slowdowns and crashes
+    let max_rate_for_unit = MAX_SAFE_CPS * rate_unit.unit_seconds();
+    let rate = if raw_rate > max_rate_for_unit {
+        set_control_text(ctx.controls.edit_rate, &format!("{}", max_rate_for_unit as u64));
+        max_rate_for_unit
+    } else {
+        raw_rate
     };
 
     let interval = calculate_interval(timing_mode, hr, min, sec, ms, rate, rate_unit);
@@ -230,6 +264,9 @@ fn start_clicker(hwnd: HWND, ctx: &mut WindowContext) {
     let hotkey_name = vk_to_string(ctx.state.hotkey);
     set_control_text(ctx.controls.btn_start, &format!("STOP ({})", hotkey_name));
     set_controls_enabled(&ctx.controls, false);
+    unsafe {
+        InvalidateRect(hwnd, null_mut(), 1);
+    }
 
     // Spawn background worker thread
     let hwnd_raw = hwnd as isize;
@@ -263,6 +300,9 @@ fn stop_clicker(hwnd: HWND, ctx: &mut WindowContext) {
     set_control_text(ctx.controls.btn_start, &format!("START ({})", hotkey_name));
     set_controls_enabled(&ctx.controls, true);
     update_location_state(&ctx.controls, ctx.state.input_mode, ctx.state.location_mode);
+    unsafe {
+        InvalidateRect(hwnd, null_mut(), 1);
+    }
 }
 
 fn toggle_clicker(hwnd: HWND, ctx: &mut WindowContext) {
@@ -512,7 +552,7 @@ unsafe extern "system" fn wnd_proc(
                 }
 
                 ID_RADIO_INTERVAL | ID_LBL_RADIO_INTERVAL => {
-                    if notification == BN_CLICKED_U16 {
+                    if notification == BN_CLICKED_U16 && !ctx.state.is_running {
                         ctx.state.timing_mode = 0;
                         button_set_checked(ctx.controls.radio_interval, true);
                         button_set_checked(ctx.controls.radio_rate, false);
@@ -523,7 +563,7 @@ unsafe extern "system" fn wnd_proc(
                 }
 
                 ID_RADIO_RATE | ID_LBL_RADIO_RATE => {
-                    if notification == BN_CLICKED_U16 {
+                    if notification == BN_CLICKED_U16 && !ctx.state.is_running {
                         ctx.state.timing_mode = 1;
                         button_set_checked(ctx.controls.radio_interval, false);
                         button_set_checked(ctx.controls.radio_rate, true);
@@ -534,7 +574,7 @@ unsafe extern "system" fn wnd_proc(
                 }
 
                 ID_RADIO_MOUSE | ID_LBL_RADIO_MOUSE => {
-                    if notification == BN_CLICKED_U16 {
+                    if notification == BN_CLICKED_U16 && !ctx.state.is_running {
                         let current_type = get_click_type_from_combo(ctx.controls.combo_click_type, ctx.state.input_mode);
                         let current_trigger = combobox_get_cursel(ctx.controls.combo_trigger_mode);
                         ctx.state.input_mode = 0;
@@ -552,7 +592,7 @@ unsafe extern "system" fn wnd_proc(
                 }
 
                 ID_RADIO_KEYBOARD | ID_LBL_RADIO_KEYBOARD => {
-                    if notification == BN_CLICKED_U16 {
+                    if notification == BN_CLICKED_U16 && !ctx.state.is_running {
                         let current_type = get_click_type_from_combo(ctx.controls.combo_click_type, ctx.state.input_mode);
                         let current_trigger = combobox_get_cursel(ctx.controls.combo_trigger_mode);
                         ctx.state.input_mode = 1;
@@ -570,7 +610,7 @@ unsafe extern "system" fn wnd_proc(
                 }
 
                 ID_RADIO_LOC_CURRENT | ID_LBL_RADIO_LOC_CURRENT => {
-                    if notification == BN_CLICKED_U16 {
+                    if notification == BN_CLICKED_U16 && !ctx.state.is_running && ctx.state.input_mode == 0 {
                         ctx.state.location_mode = 0;
                         button_set_checked(ctx.controls.radio_loc_current, true);
                         button_set_checked(ctx.controls.radio_loc_specific, false);
@@ -581,7 +621,7 @@ unsafe extern "system" fn wnd_proc(
                 }
 
                 ID_RADIO_LOC_SPECIFIC | ID_LBL_RADIO_LOC_SPECIFIC => {
-                    if notification == BN_CLICKED_U16 {
+                    if notification == BN_CLICKED_U16 && !ctx.state.is_running && ctx.state.input_mode == 0 {
                         ctx.state.location_mode = 1;
                         button_set_checked(ctx.controls.radio_loc_current, false);
                         button_set_checked(ctx.controls.radio_loc_specific, true);
@@ -767,14 +807,30 @@ unsafe extern "system" fn wnd_proc(
                 if is_edit {
                     SetBkMode(hdc, 2 /* OPAQUE */);
                     SetBkColor(hdc, COLOR_SURFACE_DIS);
-                    SetTextColor(hdc, rgb(161, 161, 170));
+                    SetTextColor(hdc, COLOR_TEXT_MUTED);
                     return ctx.theme.disabled_edit_brush as LRESULT;
                 }
 
-                let text_color = if windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(ctrl_hwnd) == 0 {
-                    rgb(161, 161, 170)
+                // Determine if this static label represents an inactive or running state.
+                // When autoclicker is running, all labels are dimmed with clean, crisp COLOR_TEXT_MUTED font (no 3D emboss).
+                // When stopped, location labels are dimmed in Keyboard mode, and X/Y labels are dimmed in Current location mode.
+                let is_dimmed = ctx.state.is_running
+                    || (ctx.state.input_mode == 1 && (
+                        ctrl_hwnd == ctx.controls.lbl_location
+                        || ctrl_hwnd == ctx.controls.lbl_radio_loc_current
+                        || ctrl_hwnd == ctx.controls.lbl_radio_loc_specific
+                        || ctrl_hwnd == ctx.controls.lbl_loc_x
+                        || ctrl_hwnd == ctx.controls.lbl_loc_y
+                    ))
+                    || (ctx.state.location_mode == 0 && (
+                        ctrl_hwnd == ctx.controls.lbl_loc_x
+                        || ctrl_hwnd == ctx.controls.lbl_loc_y
+                    ));
+
+                let text_color = if is_dimmed {
+                    COLOR_TEXT_MUTED
                 } else {
-                    rgb(255, 255, 255)
+                    COLOR_TEXT_PRIMARY
                 };
 
                 SetBkMode(hdc, 1 /* TRANSPARENT */);

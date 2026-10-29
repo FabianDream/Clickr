@@ -34,6 +34,11 @@ impl Drop for TimerResolutionGuard {
 
 pub const WM_APP_STOPPED: u32 = 0x8001;
 
+/// Maximum safe CPS limit to prevent overloading Windows processes, saturating message queues, or crashing apps.
+pub const MAX_SAFE_CPS: f64 = 100.0;
+/// Minimum safe interval corresponding to MAX_SAFE_CPS (10 ms = 100 CPS).
+pub const MIN_SAFE_INTERVAL: Duration = Duration::from_millis(10);
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TimingMode {
     Interval,
@@ -134,7 +139,8 @@ impl WorkerSignal {
 }
 
 /// Calculate the delay duration based on the selected mode and parameters.
-/// Strictly enforces a safe minimum delay of 1 ms and handles zero/invalid values gracefully.
+/// Strictly enforces a safe maximum of 100 CPS (minimum 10 ms interval) to prevent
+/// message queue exhaustion, UI freezing, and application crashes on Windows.
 pub fn calculate_interval(
     mode: TimingMode,
     hr: u64,
@@ -157,9 +163,11 @@ pub fn calculate_interval(
                 Duration::from_millis(100)
             } else {
                 let unit_sec = rate_unit.unit_seconds();
-                let secs_per_click = unit_sec / rate;
+                let max_rate = MAX_SAFE_CPS * unit_sec;
+                let safe_rate = rate.min(max_rate);
+                let secs_per_click = unit_sec / safe_rate;
                 if secs_per_click <= 0.0 || secs_per_click.is_nan() {
-                    Duration::from_millis(1)
+                    MIN_SAFE_INTERVAL
                 } else {
                     Duration::from_secs_f64(secs_per_click)
                 }
@@ -167,9 +175,9 @@ pub fn calculate_interval(
         }
     };
 
-    // Enforce safe minimum delay (1 ms minimum / max 1000 CPS) to never busy-lock the CPU
-    if raw < Duration::from_millis(1) {
-        Duration::from_millis(1)
+    // Enforce safe minimum delay (10 ms minimum / max 100 CPS) to never choke Windows processes or crash apps
+    if raw < MIN_SAFE_INTERVAL {
+        MIN_SAFE_INTERVAL
     } else {
         raw
     }
@@ -617,7 +625,7 @@ mod tests {
     #[test]
     fn test_calculate_interval_min_clamp() {
         let dur = calculate_interval(TimingMode::Interval, 0, 0, 0, 0, 0.0, RateUnit::PerSecond);
-        assert_eq!(dur, Duration::from_millis(1));
+        assert_eq!(dur, Duration::from_millis(10));
     }
 
     #[test]
@@ -641,13 +649,41 @@ mod tests {
     #[test]
     fn test_calculate_rate_zero_safe() {
         let dur = calculate_interval(TimingMode::Rate, 0, 0, 0, 0, 0.0, RateUnit::PerSecond);
-        assert!(dur >= Duration::from_millis(1));
+        assert!(dur >= Duration::from_millis(10));
     }
 
     #[test]
     fn test_calculate_rate_high_cps_clamp() {
         let dur = calculate_interval(TimingMode::Rate, 0, 0, 0, 0, 10000.0, RateUnit::PerSecond);
-        assert_eq!(dur, Duration::from_millis(1));
+        assert_eq!(dur, Duration::from_millis(10));
+    }
+
+    #[test]
+    fn test_calculate_rate_safe_cps_clamping() {
+        // CPS mode: > 100 CPS clamped to 100 CPS (10ms)
+        assert_eq!(
+            calculate_interval(TimingMode::Rate, 0, 0, 0, 0, 200.0, RateUnit::PerSecond),
+            Duration::from_millis(10)
+        );
+        // CPM mode: > 6000 CPM clamped to 6000 CPM (10ms)
+        assert_eq!(
+            calculate_interval(TimingMode::Rate, 0, 0, 0, 0, 12000.0, RateUnit::PerMinute),
+            Duration::from_millis(10)
+        );
+        // CPH mode: > 360,000 CPH clamped to 360,000 CPH (10ms)
+        assert_eq!(
+            calculate_interval(TimingMode::Rate, 0, 0, 0, 0, 720000.0, RateUnit::PerHour),
+            Duration::from_millis(10)
+        );
+        // Safe rate below limit is unaffected (e.g. 50 CPS -> 20ms, 100 CPS -> 10ms)
+        assert_eq!(
+            calculate_interval(TimingMode::Rate, 0, 0, 0, 0, 50.0, RateUnit::PerSecond),
+            Duration::from_millis(20)
+        );
+        assert_eq!(
+            calculate_interval(TimingMode::Rate, 0, 0, 0, 0, 100.0, RateUnit::PerSecond),
+            Duration::from_millis(10)
+        );
     }
 
     #[test]
