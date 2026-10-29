@@ -35,8 +35,27 @@ jobs:
         run: Copy-Item target\release\clickr.exe Clickr.exe
 
       - name: Upload to Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.tag_name || github.ref_name }}
-          files: Clickr.exe
-          generate_release_notes: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $TAG = if ($env:RELEASE_TAG) {
+            $env:RELEASE_TAG
+          } elseif ($env:INPUT_TAG) {
+            $env:INPUT_TAG
+          } else {
+            $env:REF_NAME
+          }
+
+          Write-Host "Target tag is: $TAG"
+
+          $exists = gh release view $TAG --json id -q ".id" 2>$null
+          if ($exists) {
+            Write-Host "Found existing release $TAG. Uploading Clickr.exe..."
+            gh release upload $TAG Clickr.exe --clobber
+          } else {
+            Write-Host "Creating release $TAG and uploading Clickr.exe..."
+            gh release create $TAG Clickr.exe --title "$TAG" --generate-notes
+          }
