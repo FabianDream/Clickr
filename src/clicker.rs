@@ -65,14 +65,47 @@ pub enum MouseButton {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ClickType {
+    Single,
+    Double,
+    Hold,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TriggerMode {
+    Toggle,
+    Hold,
+    HoldMouse,
+}
+
+pub static PHYSICAL_MOUSE_DOWN: AtomicBool = AtomicBool::new(false);
+
+pub fn is_physical_mouse_down() -> bool {
+    PHYSICAL_MOUSE_DOWN.load(Ordering::Relaxed)
+}
+
+pub fn set_physical_mouse_down(down: bool) {
+    PHYSICAL_MOUSE_DOWN.store(down, Ordering::SeqCst);
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MouseLocation {
+    Current,
+    Specific(i32, i32),
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ClickTarget {
-    Mouse(MouseButton),
-    Keyboard(u16),
+    Mouse(MouseButton, ClickType),
+    Keyboard(u16, ClickType),
 }
 
 #[derive(Clone, Debug)]
 pub struct ClickerConfig {
     pub target: ClickTarget,
+    pub location: MouseLocation,
+    pub trigger_mode: TriggerMode,
+    pub hotkey: u32,
     pub interval: Duration,
     pub amount: u64,
 }
@@ -142,19 +175,108 @@ pub fn calculate_interval(
     }
 }
 
-/// Simulate a single mouse click (down + up) or keyboard keypress (down + up)
-/// atomically via Win32 SendInput.
+/// Press a target mouse button or keyboard key down (used for Hold click type).
+pub fn press_target_down(target: ClickTarget) {
+    unsafe {
+        match target {
+            ClickTarget::Mouse(btn, ClickType::Hold) => {
+                let down_flag = match btn {
+                    MouseButton::Left => MOUSEEVENTF_LEFTDOWN,
+                    MouseButton::Right => MOUSEEVENTF_RIGHTDOWN,
+                    MouseButton::Middle => MOUSEEVENTF_MIDDLEDOWN,
+                };
+                let input = INPUT {
+                    r#type: INPUT_MOUSE,
+                    Anonymous: INPUT_0 {
+                        mi: MOUSEINPUT {
+                            dx: 0,
+                            dy: 0,
+                            mouseData: 0,
+                            dwFlags: down_flag,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                };
+                SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+            }
+            ClickTarget::Keyboard(vk, ClickType::Hold) => {
+                let input = INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: vk,
+                            wScan: 0,
+                            dwFlags: 0,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                };
+                SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Release a target mouse button or keyboard key up (used for Hold click type).
+pub fn release_target(target: ClickTarget) {
+    unsafe {
+        match target {
+            ClickTarget::Mouse(btn, ClickType::Hold) => {
+                let up_flag = match btn {
+                    MouseButton::Left => MOUSEEVENTF_LEFTUP,
+                    MouseButton::Right => MOUSEEVENTF_RIGHTUP,
+                    MouseButton::Middle => MOUSEEVENTF_MIDDLEUP,
+                };
+                let input = INPUT {
+                    r#type: INPUT_MOUSE,
+                    Anonymous: INPUT_0 {
+                        mi: MOUSEINPUT {
+                            dx: 0,
+                            dy: 0,
+                            mouseData: 0,
+                            dwFlags: up_flag,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                };
+                SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+            }
+            ClickTarget::Keyboard(vk, ClickType::Hold) => {
+                let input = INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: vk,
+                            wScan: 0,
+                            dwFlags: KEYEVENTF_KEYUP,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                };
+                SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Simulate a single/double click or hold state for mouse or keyboard.
 pub fn simulate_click(target: ClickTarget) {
     unsafe {
         match target {
-            ClickTarget::Mouse(btn) => {
+            ClickTarget::Mouse(btn, click_type) => {
                 let (down_flag, up_flag) = match btn {
                     MouseButton::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
                     MouseButton::Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
                     MouseButton::Middle => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
                 };
 
-                let inputs = [
+                let make_inputs = || [
                     INPUT {
                         r#type: INPUT_MOUSE,
                         Anonymous: INPUT_0 {
@@ -183,10 +305,26 @@ pub fn simulate_click(target: ClickTarget) {
                     },
                 ];
 
-                SendInput(2, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+                match click_type {
+                    ClickType::Single => {
+                        let inputs = make_inputs();
+                        SendInput(2, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+                    }
+                    ClickType::Double => {
+                        let inputs1 = make_inputs();
+                        SendInput(2, inputs1.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+                        // Inter-click interval for Windows to recognize distinct double-click events
+                        std::thread::sleep(Duration::from_millis(15));
+                        let inputs2 = make_inputs();
+                        SendInput(2, inputs2.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+                    }
+                    ClickType::Hold => {
+                        press_target_down(target);
+                    }
+                }
             }
-            ClickTarget::Keyboard(vk) => {
-                let inputs = [
+            ClickTarget::Keyboard(vk, click_type) => {
+                let make_inputs = || [
                     INPUT {
                         r#type: INPUT_KEYBOARD,
                         Anonymous: INPUT_0 {
@@ -213,7 +351,22 @@ pub fn simulate_click(target: ClickTarget) {
                     },
                 ];
 
-                SendInput(2, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+                match click_type {
+                    ClickType::Single => {
+                        let inputs = make_inputs();
+                        SendInput(2, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+                    }
+                    ClickType::Double => {
+                        let inputs1 = make_inputs();
+                        SendInput(2, inputs1.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+                        std::thread::sleep(Duration::from_millis(15));
+                        let inputs2 = make_inputs();
+                        SendInput(2, inputs2.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+                    }
+                    ClickType::Hold => {
+                        press_target_down(target);
+                    }
+                }
             }
         }
     }
@@ -243,14 +396,91 @@ pub fn run_worker_loop_internal<F: FnMut(ClickTarget)>(
     // Enable 1ms Windows timer resolution during clicking via RAII guard
     let _timer_guard = TimerResolutionGuard::new();
 
+    // RAII guard guarantees any held mouse button or keyboard key is released when the worker halts
+    struct ReleaseGuard(ClickTarget);
+    impl Drop for ReleaseGuard {
+        fn drop(&mut self) {
+            release_target(self.0);
+        }
+    }
+    let _release_guard = ReleaseGuard(config.target);
+
     let mut count: u64 = 0;
     let mut next_click_time = Instant::now();
+    let mut was_paused = false;
+
+    // Immediately enforce mouse position if specific location is selected
+    if let MouseLocation::Specific(x, y) = config.location {
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y);
+        }
+    }
+
+    // Immediately press down target if Hold click type and NOT in HoldMouse mode
+    if config.trigger_mode != TriggerMode::HoldMouse {
+        press_target_down(config.target);
+    }
 
     while signal.running.load(Ordering::Relaxed) {
+        // In Hold trigger mode (Hotkey), monitor hotkey state from background thread
+        if config.trigger_mode == TriggerMode::Hold && config.hotkey > 0 {
+            let key_down = unsafe {
+                (GetAsyncKeyState(config.hotkey as i32) as u16 & 0x8000) != 0
+            };
+            if !key_down {
+                signal.running.store(false, Ordering::SeqCst);
+                if hwnd_raw != 0 {
+                    unsafe {
+                        PostMessageW(hwnd_raw as HWND, WM_APP_STOPPED, 0, 0);
+                    }
+                }
+                break;
+            }
+        }
+
+        // In HoldMouse trigger mode, pause clicking while physical mouse button is not held down
+        if config.trigger_mode == TriggerMode::HoldMouse {
+            if !is_physical_mouse_down() {
+                if !was_paused {
+                    release_target(config.target);
+                    was_paused = true;
+                }
+
+                let lock = signal.mutex.lock().unwrap();
+                if !*lock || !signal.running.load(Ordering::Relaxed) {
+                    break;
+                }
+                let (new_lock, _) = signal
+                    .condvar
+                    .wait_timeout(lock, Duration::from_millis(15))
+                    .unwrap();
+                if !*new_lock || !signal.running.load(Ordering::Relaxed) {
+                    break;
+                }
+                continue;
+            }
+
+            // Physical mouse is pressed down: if we just unpaused, reset schedule and press down if Hold click type
+            if was_paused {
+                was_paused = false;
+                next_click_time = Instant::now();
+                if matches!(config.target, ClickTarget::Mouse(_, ClickType::Hold) | ClickTarget::Keyboard(_, ClickType::Hold)) {
+                    press_target_down(config.target);
+                }
+            }
+        }
+
+        // Enforce mouse position before evaluating target window and clicking
+        if let MouseLocation::Specific(x, y) = config.location {
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y);
+            }
+        }
+
         // Prevent self-clicking / self-typing if Clickr's window is targeted
         let skip = if hwnd_raw != 0 {
             match config.target {
-                ClickTarget::Mouse(_) => unsafe {
+                ClickTarget::Mouse(_, _) => unsafe {
                     let mut pt: windows_sys::Win32::Foundation::POINT = std::mem::zeroed();
                     windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt);
                     let wnd = windows_sys::Win32::UI::WindowsAndMessaging::WindowFromPoint(pt);
@@ -260,7 +490,7 @@ pub fn run_worker_loop_internal<F: FnMut(ClickTarget)>(
                     );
                     wnd == hwnd_raw as HWND || root == hwnd_raw as HWND
                 },
-                ClickTarget::Keyboard(_) => unsafe {
+                ClickTarget::Keyboard(_, _) => unsafe {
                     let foreground = windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
                     let root = windows_sys::Win32::UI::WindowsAndMessaging::GetAncestor(
                         foreground,
@@ -292,8 +522,6 @@ pub fn run_worker_loop_internal<F: FnMut(ClickTarget)>(
         next_click_time += config.interval;
 
         // 2. Lag-Spike / Buffer Guard:
-        // If the system experienced a major freeze and current_time falls behind next_click_time
-        // by more than 5 intervals (or 50ms), reset next_click_time = now to prevent catch-up bursts
         let now = Instant::now();
         if now > next_click_time {
             let lag = now.duration_since(next_click_time);
@@ -305,6 +533,29 @@ pub fn run_worker_loop_internal<F: FnMut(ClickTarget)>(
 
         // 3. Low-CPU Hybrid Wait for remaining time
         while signal.running.load(Ordering::Relaxed) {
+            // Check hotkey in Hold trigger mode
+            if config.trigger_mode == TriggerMode::Hold && config.hotkey > 0 {
+                let key_down = unsafe {
+                    (GetAsyncKeyState(config.hotkey as i32) as u16 & 0x8000) != 0
+                };
+                if !key_down {
+                    signal.running.store(false, Ordering::SeqCst);
+                    if hwnd_raw != 0 {
+                        unsafe {
+                            PostMessageW(hwnd_raw as HWND, WM_APP_STOPPED, 0, 0);
+                        }
+                    }
+                    return;
+                }
+            }
+
+            // In HoldMouse trigger mode: if mouse was released during wait, release target and break to pause
+            if config.trigger_mode == TriggerMode::HoldMouse && !is_physical_mouse_down() {
+                release_target(config.target);
+                was_paused = true;
+                break;
+            }
+
             let current = Instant::now();
             if current >= next_click_time {
                 break;
@@ -315,13 +566,27 @@ pub fn run_worker_loop_internal<F: FnMut(ClickTarget)>(
             // Phase 1: Coarse responsive sleep while remaining > 1.5ms (0% CPU)
             if remaining > Duration::from_micros(1500) {
                 let sleep_duration = (remaining - Duration::from_micros(1000)).max(Duration::from_millis(1));
+                // Clamp sleep step to at most 15ms if in Hold/HoldMouse trigger mode or Specific location mode
+                let mut sleep_step = sleep_duration;
+                if let MouseLocation::Specific(_, _) = config.location {
+                    sleep_step = sleep_step.min(Duration::from_millis(20));
+                }
+                if config.trigger_mode == TriggerMode::Hold || config.trigger_mode == TriggerMode::HoldMouse {
+                    sleep_step = sleep_step.min(Duration::from_millis(15));
+                }
+
                 let lock = signal.mutex.lock().unwrap();
                 if !*lock || !signal.running.load(Ordering::Relaxed) {
                     return;
                 }
-                let (new_lock, _) = signal.condvar.wait_timeout(lock, sleep_duration).unwrap();
+                let (new_lock, _) = signal.condvar.wait_timeout(lock, sleep_step).unwrap();
                 if !*new_lock || !signal.running.load(Ordering::Relaxed) {
                     return;
+                }
+                if let MouseLocation::Specific(x, y) = config.location {
+                    unsafe {
+                        windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y);
+                    }
                 }
                 continue;
             }
@@ -389,7 +654,10 @@ mod tests {
     fn test_timing_drift_compensation_100cps() {
         let signal = Arc::new(WorkerSignal::new());
         let config = ClickerConfig {
-            target: ClickTarget::Mouse(MouseButton::Left),
+            target: ClickTarget::Mouse(MouseButton::Left, ClickType::Single),
+            location: MouseLocation::Current,
+            trigger_mode: TriggerMode::Toggle,
+            hotkey: 0,
             interval: Duration::from_millis(10), // 100 CPS
             amount: 30,                          // 30 clicks -> 290ms nominal
         };
@@ -409,9 +677,6 @@ mod tests {
         let elapsed = start.elapsed();
         assert_eq!(click_count, 30);
 
-        // 30 clicks at 100 CPS (first click at 0ms, 29th at 290ms).
-        // Without drift compensation, 400µs work + OS sleep jitter accumulates ~350ms-380ms.
-        // With drift compensation, total elapsed time is strictly within ±15ms of 290ms.
         assert!(
             elapsed >= Duration::from_millis(280) && elapsed <= Duration::from_millis(315),
             "Elapsed {:?} outside expected range (280ms - 315ms)",
@@ -423,7 +688,10 @@ mod tests {
     fn test_lag_spike_guard_prevents_burst() {
         let signal = Arc::new(WorkerSignal::new());
         let config = ClickerConfig {
-            target: ClickTarget::Mouse(MouseButton::Left),
+            target: ClickTarget::Mouse(MouseButton::Left, ClickType::Single),
+            location: MouseLocation::Current,
+            trigger_mode: TriggerMode::Toggle,
+            hotkey: 0,
             interval: Duration::from_millis(10),
             amount: 5,
         };
@@ -433,16 +701,12 @@ mod tests {
         run_worker_loop_internal(0, signal, config, |_| {
             timestamps.push(Instant::now());
             if timestamps.len() == 2 {
-                // Simulate a 70ms system freeze during click #2
                 std::thread::sleep(Duration::from_millis(70));
             }
         });
 
         assert_eq!(timestamps.len(), 5);
 
-        // Click #3 immediately follows the 70ms lag spike.
-        // Because of the lag-spike guard, Click #4 must wait for a full interval (~10ms)
-        // rather than dumping Click #3, #4, #5 instantly back-to-back in 0ms!
         let diff_3_to_4 = timestamps[3].duration_since(timestamps[2]);
         assert!(
             diff_3_to_4 >= Duration::from_millis(8),
@@ -455,7 +719,10 @@ mod tests {
     fn test_instantaneous_worker_stop() {
         let signal = Arc::new(WorkerSignal::new());
         let config = ClickerConfig {
-            target: ClickTarget::Mouse(MouseButton::Left),
+            target: ClickTarget::Mouse(MouseButton::Left, ClickType::Single),
+            location: MouseLocation::Current,
+            trigger_mode: TriggerMode::Toggle,
+            hotkey: 0,
             interval: Duration::from_secs(5), // 5 seconds interval
             amount: 0,
         };
@@ -467,17 +734,14 @@ mod tests {
             start.elapsed()
         });
 
-        // Let the worker enter its sleep wait
         std::thread::sleep(Duration::from_millis(20));
 
-        // Signal stop
         let stop_time = Instant::now();
         signal.stop();
 
         let elapsed = handle.join().expect("Worker thread panicked");
         let stop_latency = stop_time.elapsed();
 
-        // Worker should wake and terminate within < 15ms, not 5000ms
         assert!(
             stop_latency < Duration::from_millis(30),
             "Worker took too long to stop: {:?}",
@@ -495,7 +759,10 @@ mod tests {
         let signal = Arc::new(WorkerSignal::new());
         let total_clicks = 100;
         let config = ClickerConfig {
-            target: ClickTarget::Mouse(MouseButton::Left),
+            target: ClickTarget::Mouse(MouseButton::Left, ClickType::Single),
+            location: MouseLocation::Current,
+            trigger_mode: TriggerMode::Toggle,
+            hotkey: 0,
             interval: Duration::from_millis(10), // 100 CPS
             amount: total_clicks,
         };
@@ -505,7 +772,6 @@ mod tests {
         let overall_start = Instant::now();
         run_worker_loop_internal(0, signal, config, |_| {
             timestamps.push(Instant::now());
-            // Simulate realistic SendInput call time (~150µs)
             let spin = Instant::now() + Duration::from_micros(150);
             while Instant::now() < spin {
                 std::hint::spin_loop();
@@ -533,7 +799,6 @@ mod tests {
         println!("Achieved CPS: {:.2} CPS", achieved_cps);
         println!("Overall Schedule CPS: {:.2} CPS", overall_cps);
 
-        // Drift should be negligible (within ±1% of target 100 CPS)
         assert!(
             achieved_cps >= 98.0 && achieved_cps <= 102.0,
             "Achieved CPS {:.2} not within 98-102 CPS",
@@ -553,7 +818,10 @@ mod tests {
         let signal = Arc::new(WorkerSignal::new());
         let clicks = 150; // 1.5 seconds at 100 CPS
         let config = ClickerConfig {
-            target: ClickTarget::Mouse(MouseButton::Left),
+            target: ClickTarget::Mouse(MouseButton::Left, ClickType::Single),
+            location: MouseLocation::Current,
+            trigger_mode: TriggerMode::Toggle,
+            hotkey: 0,
             interval: Duration::from_millis(10), // 100 CPS
             amount: clicks,
         };
@@ -566,7 +834,6 @@ mod tests {
 
             let wall_start = Instant::now();
             run_worker_loop_internal(0, sig_clone, config, |_| {
-                // Realistic input call overhead (~50µs)
                 let spin = Instant::now() + Duration::from_micros(50);
                 while Instant::now() < spin {
                     std::hint::spin_loop();
@@ -587,17 +854,187 @@ mod tests {
         println!("\n=== Worker Thread Cycle Time Benchmark (100 CPS) ===");
         println!("Wall Elapsed: {:.3}s, Raw CPU Cycles Consumed: {}", wall_secs, cycles);
 
-        // Assuming a typical 2.5–3.5 GHz clock speed:
         let assumed_freq_hz = 3.0e9;
         let thread_active_secs = cycles as f64 / assumed_freq_hz;
         let core_cpu_pct = (thread_active_secs / wall_secs) * 100.0;
         println!("Estimated Active Core CPU Usage: {:.2}%", core_cpu_pct);
 
-        // Active thread core CPU must be under 10% (under 1% of an 8+ core system)
         assert!(
             core_cpu_pct < 10.0,
             "Active CPU usage too high: {:.2}%",
             core_cpu_pct
         );
+    }
+
+    #[test]
+    fn test_mouse_location_config() {
+        let config_current = ClickerConfig {
+            target: ClickTarget::Mouse(MouseButton::Left, ClickType::Single),
+            location: MouseLocation::Current,
+            trigger_mode: TriggerMode::Toggle,
+            hotkey: 0,
+            interval: Duration::from_millis(100),
+            amount: 10,
+        };
+        assert_eq!(config_current.location, MouseLocation::Current);
+
+        let config_specific = ClickerConfig {
+            target: ClickTarget::Mouse(MouseButton::Right, ClickType::Single),
+            location: MouseLocation::Specific(500, 300),
+            trigger_mode: TriggerMode::Toggle,
+            hotkey: 0,
+            interval: Duration::from_millis(50),
+            amount: 5,
+        };
+        assert_eq!(config_specific.location, MouseLocation::Specific(500, 300));
+    }
+
+    #[test]
+    fn test_double_click_config_and_execution() {
+        let signal = Arc::new(WorkerSignal::new());
+        let config = ClickerConfig {
+            target: ClickTarget::Mouse(MouseButton::Left, ClickType::Double),
+            location: MouseLocation::Current,
+            trigger_mode: TriggerMode::Toggle,
+            hotkey: 0,
+            interval: Duration::from_millis(10),
+            amount: 3,
+        };
+
+        let mut received_targets = Vec::new();
+        run_worker_loop_internal(0, signal, config, |t| {
+            received_targets.push(t);
+        });
+
+        assert_eq!(received_targets.len(), 3);
+        assert_eq!(
+            received_targets[0],
+            ClickTarget::Mouse(MouseButton::Left, ClickType::Double)
+        );
+    }
+
+    #[test]
+    fn test_hold_click_type_mouse_and_keyboard() {
+        let signal = Arc::new(WorkerSignal::new());
+        let config_mouse = ClickerConfig {
+            target: ClickTarget::Mouse(MouseButton::Left, ClickType::Hold),
+            location: MouseLocation::Current,
+            trigger_mode: TriggerMode::Toggle,
+            hotkey: 0,
+            interval: Duration::from_millis(10),
+            amount: 2,
+        };
+
+        let mut mouse_targets = Vec::new();
+        run_worker_loop_internal(0, signal.clone(), config_mouse, |t| {
+            mouse_targets.push(t);
+        });
+        assert_eq!(mouse_targets.len(), 2);
+        assert_eq!(mouse_targets[0], ClickTarget::Mouse(MouseButton::Left, ClickType::Hold));
+
+        let signal2 = Arc::new(WorkerSignal::new());
+        let config_kbd = ClickerConfig {
+            target: ClickTarget::Keyboard(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_SPACE, ClickType::Hold),
+            location: MouseLocation::Current,
+            trigger_mode: TriggerMode::Toggle,
+            hotkey: 0,
+            interval: Duration::from_millis(10),
+            amount: 2,
+        };
+
+        let mut kbd_targets = Vec::new();
+        run_worker_loop_internal(0, signal2, config_kbd, |t| {
+            kbd_targets.push(t);
+        });
+        assert_eq!(kbd_targets.len(), 2);
+        assert_eq!(kbd_targets[0], ClickTarget::Keyboard(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_SPACE, ClickType::Hold));
+    }
+
+    #[test]
+    fn test_hold_trigger_mode_stops_when_hotkey_released() {
+        let signal = Arc::new(WorkerSignal::new());
+        let config = ClickerConfig {
+            target: ClickTarget::Mouse(MouseButton::Left, ClickType::Single),
+            location: MouseLocation::Current,
+            trigger_mode: TriggerMode::Hold,
+            hotkey: 0x88, // An unpressed unassigned virtual key
+            interval: Duration::from_millis(100),
+            amount: 10,
+        };
+
+        let mut count = 0;
+        let start = Instant::now();
+        run_worker_loop_internal(0, signal, config, |_| {
+            count += 1;
+        });
+        let elapsed = start.elapsed();
+        // Since hotkey 0x88 is not held down, it terminates immediately
+        assert_eq!(count, 0);
+        assert!(elapsed < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn test_hold_mouse_trigger_mode() {
+        set_physical_mouse_down(false);
+        let signal = Arc::new(WorkerSignal::new());
+        let config = ClickerConfig {
+            target: ClickTarget::Mouse(MouseButton::Left, ClickType::Single),
+            location: MouseLocation::Current,
+            trigger_mode: TriggerMode::HoldMouse,
+            hotkey: 0,
+            interval: Duration::from_millis(5),
+            amount: 0,
+        };
+
+        let click_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let count_clone = click_count.clone();
+        let signal_clone = signal.clone();
+
+        let handle = std::thread::spawn(move || {
+            run_worker_loop_internal(0, signal_clone, config, |_| {
+                count_clone.fetch_add(1, Ordering::SeqCst);
+            });
+        });
+
+        // 1. Initially mouse button is not held: verify it does not click
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(click_count.load(Ordering::SeqCst), 0);
+
+        // 2. User holds down mouse click: verify it starts clicking
+        set_physical_mouse_down(true);
+        signal.condvar.notify_all();
+        std::thread::sleep(Duration::from_millis(30));
+        let count_after_down = click_count.load(Ordering::SeqCst);
+        assert!(
+            count_after_down >= 2,
+            "Expected at least 2 clicks while held down, got {}",
+            count_after_down
+        );
+
+        // 3. User releases mouse click: verify it pauses clicking
+        set_physical_mouse_down(false);
+        signal.condvar.notify_all();
+        std::thread::sleep(Duration::from_millis(25));
+        let count_after_release = click_count.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(
+            click_count.load(Ordering::SeqCst),
+            count_after_release,
+            "Should remain paused when released"
+        );
+
+        // 4. User holds down mouse click again: verify it resumes clicking
+        set_physical_mouse_down(true);
+        signal.condvar.notify_all();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            click_count.load(Ordering::SeqCst) > count_after_release,
+            "Should resume clicking on second hold"
+        );
+
+        // Cleanup
+        set_physical_mouse_down(false);
+        signal.stop();
+        handle.join().unwrap();
     }
 }

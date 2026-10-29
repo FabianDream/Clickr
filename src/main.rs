@@ -34,6 +34,8 @@ extern "system" {
     ) -> i32;
 }
 
+const ID_TIMER_HOLD: usize = 2001;
+
 struct WindowContext {
     hwnd: HWND,
     state: AppState,
@@ -51,6 +53,10 @@ fn parse_u64_or_default(s: &str, def: u64) -> u64 {
     s.trim().parse::<u64>().unwrap_or(def)
 }
 
+fn parse_i32_or_0(s: &str) -> i32 {
+    s.trim().parse::<i32>().unwrap_or(0)
+}
+
 fn parse_f64_or_default(s: &str, def: f64) -> f64 {
     let s = s.trim();
     if let Ok(val) = s.parse::<f64>() {
@@ -64,9 +70,12 @@ fn parse_f64_or_default(s: &str, def: f64) -> f64 {
 fn save_current_settings(ctx: &WindowContext) {
     let timing_mode = ctx.state.timing_mode;
     let input_mode = ctx.state.input_mode;
+    let location_mode = ctx.state.location_mode;
+    let trigger_mode = combobox_get_cursel(ctx.controls.combo_trigger_mode) as u32;
 
     let rate_unit = combobox_get_cursel(ctx.controls.combo_rate_unit);
     let mouse_btn = combobox_get_cursel(ctx.controls.combo_mouse_btn);
+    let click_type = get_click_type_from_combo(ctx.controls.combo_click_type, input_mode);
 
     let hr = get_control_text(ctx.controls.edit_hr);
     let min = get_control_text(ctx.controls.edit_min);
@@ -74,6 +83,8 @@ fn save_current_settings(ctx: &WindowContext) {
     let ms = get_control_text(ctx.controls.edit_ms);
     let rate = get_control_text(ctx.controls.edit_rate);
     let click_amount = get_control_text(ctx.controls.edit_amount);
+    let target_x = parse_i32_or_0(&get_control_text(ctx.controls.edit_loc_x));
+    let target_y = parse_i32_or_0(&get_control_text(ctx.controls.edit_loc_y));
 
     let (pos_x, pos_y) = unsafe {
         if IsIconic(ctx.hwnd) == 0 {
@@ -88,6 +99,7 @@ fn save_current_settings(ctx: &WindowContext) {
     let settings = AppSettings {
         hotkey: ctx.state.hotkey,
         target_key: ctx.state.target_key,
+        trigger_mode,
         timing_mode,
         hr: if hr.is_empty() { "0".to_string() } else { hr },
         min: if min.is_empty() { "0".to_string() } else { min },
@@ -97,6 +109,10 @@ fn save_current_settings(ctx: &WindowContext) {
         rate_unit,
         input_mode,
         mouse_btn,
+        click_type,
+        location_mode,
+        target_x,
+        target_y,
         click_amount: if click_amount.is_empty() { "0".to_string() } else { click_amount },
         pos_x,
         pos_y,
@@ -131,23 +147,57 @@ fn start_clicker(hwnd: HWND, ctx: &mut WindowContext) {
 
     let interval = calculate_interval(timing_mode, hr, min, sec, ms, rate, rate_unit);
 
-    // Determine input target (mouse vs keyboard)
+    let trigger_mode = match combobox_get_cursel(ctx.controls.combo_trigger_mode) {
+        1 => TriggerMode::Hold,
+        2 => TriggerMode::HoldMouse,
+        _ => TriggerMode::Toggle,
+    };
+
+    // Determine input target (mouse vs keyboard) and click type (Single/Press, Double, Hold)
+    let click_type_idx = get_click_type_from_combo(ctx.controls.combo_click_type, ctx.state.input_mode);
+    let click_type = match click_type_idx {
+        1 => ClickType::Double,
+        2 => ClickType::Hold,
+        _ => ClickType::Single,
+    };
+
     let click_target = if ctx.state.input_mode == 0 {
         let btn = match combobox_get_cursel(ctx.controls.combo_mouse_btn) {
             1 => MouseButton::Right,
             2 => MouseButton::Middle,
             _ => MouseButton::Left,
         };
-        ClickTarget::Mouse(btn)
+        ClickTarget::Mouse(btn, click_type)
     } else {
-        ClickTarget::Keyboard(ctx.state.target_key)
+        ClickTarget::Keyboard(ctx.state.target_key, click_type)
     };
+
+    ctx.state.current_target = Some(click_target);
+
+    // Determine mouse location mode (Current vs Specific coordinate)
+    let location = if ctx.state.input_mode == 0 && ctx.state.location_mode == 1 {
+        let x = parse_i32_or_0(&get_control_text(ctx.controls.edit_loc_x));
+        let y = parse_i32_or_0(&get_control_text(ctx.controls.edit_loc_y));
+        MouseLocation::Specific(x, y)
+    } else {
+        MouseLocation::Current
+    };
+
+    // Position mouse immediately if specific location is selected
+    if let MouseLocation::Specific(x, y) = location {
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y);
+        }
+    }
 
     // Determine click amount (0 = infinite)
     let amount = parse_u64_or_0(&get_control_text(ctx.controls.edit_amount));
 
     let config = ClickerConfig {
         target: click_target,
+        location,
+        trigger_mode,
+        hotkey: ctx.state.hotkey,
         interval,
         amount,
     };
@@ -155,6 +205,23 @@ fn start_clicker(hwnd: HWND, ctx: &mut WindowContext) {
     let signal = Arc::new(WorkerSignal::new());
     ctx.state.worker_signal = Some(signal.clone());
     ctx.state.is_running = true;
+
+    // In Hold trigger mode, arm a 15ms timer to quickly detect hotkey release on UI thread
+    if trigger_mode == TriggerMode::Hold {
+        unsafe {
+            SetTimer(hwnd, ID_TIMER_HOLD, 15, None);
+        }
+    }
+
+    // In HoldMouse trigger mode, monitor physical mouse button down/up via low-level hook
+    if trigger_mode == TriggerMode::HoldMouse {
+        let btn_to_monitor = if ctx.state.input_mode == 0 {
+            combobox_get_cursel(ctx.controls.combo_mouse_btn) as u32
+        } else {
+            0 // Left mouse button by default for keyboard target
+        };
+        start_mouse_hold_monitor(btn_to_monitor, signal.clone());
+    }
 
     // Save configuration settings
     save_current_settings(ctx);
@@ -171,10 +238,15 @@ fn start_clicker(hwnd: HWND, ctx: &mut WindowContext) {
     });
 }
 
-fn stop_clicker(_hwnd: HWND, ctx: &mut WindowContext) {
+fn stop_clicker(hwnd: HWND, ctx: &mut WindowContext) {
     if !ctx.state.is_running {
         return;
     }
+
+    unsafe {
+        KillTimer(hwnd, ID_TIMER_HOLD);
+    }
+    stop_mouse_hold_monitor();
 
     ctx.state.is_running = false;
 
@@ -182,10 +254,15 @@ fn stop_clicker(_hwnd: HWND, ctx: &mut WindowContext) {
         signal.stop();
     }
 
+    if let Some(target) = ctx.state.current_target.take() {
+        release_target(target);
+    }
+
     // Update UI
     let hotkey_name = vk_to_string(ctx.state.hotkey);
     set_control_text(ctx.controls.btn_start, &format!("START ({})", hotkey_name));
     set_controls_enabled(&ctx.controls, true);
+    update_location_state(&ctx.controls, ctx.state.input_mode, ctx.state.location_mode);
 }
 
 fn toggle_clicker(hwnd: HWND, ctx: &mut WindowContext) {
@@ -237,19 +314,40 @@ unsafe extern "system" fn wnd_proc(
                 button_set_checked(controls.radio_keyboard, true);
             }
             combobox_set_cursel(controls.combo_mouse_btn, settings.mouse_btn);
+            update_click_type_options(controls.combo_click_type, settings.input_mode, settings.click_type);
 
             let key_name = vk_to_string(settings.target_key as u32);
-            set_control_text(controls.btn_key_target, &format!("[ {} ]", key_name));
+            set_control_text(controls.btn_key_target, &format!("Key: {}", key_name));
 
-            // 3. Click amount
+            // 3. Location mode and coordinates
+            if settings.location_mode == 0 {
+                button_set_checked(controls.radio_loc_current, true);
+                button_set_checked(controls.radio_loc_specific, false);
+            } else {
+                button_set_checked(controls.radio_loc_current, false);
+                button_set_checked(controls.radio_loc_specific, true);
+            }
+            set_control_text(controls.edit_loc_x, &settings.target_x.to_string());
+            set_control_text(controls.edit_loc_y, &settings.target_y.to_string());
+
+            // 4. Click amount
             set_control_text(controls.edit_amount, &settings.click_amount);
+            let amount_label = if settings.input_mode == 0 {
+                "Click Amount (0 = forever):"
+            } else {
+                "Press Amount (0 = forever):"
+            };
+            set_control_text(controls.lbl_amount, amount_label);
 
-            // 4. Start/Stop hotkey
+            // 5. Start/Stop hotkey
             let hotkey_name = vk_to_string(settings.hotkey);
             set_control_text(controls.btn_start, &format!("START ({})", hotkey_name));
 
+            combobox_set_cursel(controls.combo_trigger_mode, settings.trigger_mode as usize);
+
             update_timing_visibility(&controls, settings.timing_mode);
             update_input_visibility(&controls, settings.input_mode);
+            update_location_state(&controls, settings.input_mode, settings.location_mode);
 
             // Register remembered Start/Stop hotkey
             register_start_stop_hotkey(hwnd, settings.hotkey);
@@ -257,8 +355,12 @@ unsafe extern "system" fn wnd_proc(
             let mut state = AppState::default();
             state.hotkey = settings.hotkey;
             state.target_key = settings.target_key;
+            state.trigger_mode = settings.trigger_mode;
             state.timing_mode = settings.timing_mode;
             state.input_mode = settings.input_mode;
+            state.location_mode = settings.location_mode;
+            state.target_x = settings.target_x;
+            state.target_y = settings.target_y;
             state.pos_x = settings.pos_x;
             state.pos_y = settings.pos_y;
 
@@ -346,11 +448,18 @@ unsafe extern "system" fn wnd_proc(
                             // Cancel listening
                             stop_rebind();
                             ctx.state.rebind_target = RebindTarget::None;
-                            set_control_text(ctx.controls.btn_hotkeys, "Hotkeys");
+                            set_control_text(ctx.controls.btn_hotkeys, "Set Hotkey");
                         } else {
                             // Begin listening for new hotkey
+                            stop_rebind();
+                            if ctx.state.rebind_target == RebindTarget::PickLocation {
+                                set_control_text(ctx.controls.btn_pick_pos, "Pick");
+                            } else if ctx.state.rebind_target == RebindTarget::TargetKey {
+                                let name = vk_to_string(ctx.state.target_key as u32);
+                                set_control_text(ctx.controls.btn_key_target, &format!("Key: {}", name));
+                            }
                             ctx.state.rebind_target = RebindTarget::Hotkey;
-                            set_control_text(ctx.controls.btn_hotkeys, "Press a key...");
+                            set_control_text(ctx.controls.btn_hotkeys, "Press key...");
                             start_rebind(hwnd, RebindTarget::Hotkey);
                         }
                     }
@@ -363,12 +472,41 @@ unsafe extern "system" fn wnd_proc(
                             stop_rebind();
                             ctx.state.rebind_target = RebindTarget::None;
                             let name = vk_to_string(ctx.state.target_key as u32);
-                            set_control_text(ctx.controls.btn_key_target, &format!("[ {} ]", name));
+                            set_control_text(ctx.controls.btn_key_target, &format!("Key: {}", name));
                         } else {
                             // Begin listening for target key
+                            stop_rebind();
+                            if ctx.state.rebind_target == RebindTarget::Hotkey {
+                                set_control_text(ctx.controls.btn_hotkeys, "Set Hotkey");
+                            } else if ctx.state.rebind_target == RebindTarget::PickLocation {
+                                set_control_text(ctx.controls.btn_pick_pos, "Pick");
+                            }
                             ctx.state.rebind_target = RebindTarget::TargetKey;
-                            set_control_text(ctx.controls.btn_key_target, "[ Press a key... ]");
+                            set_control_text(ctx.controls.btn_key_target, "Press key...");
                             start_rebind(hwnd, RebindTarget::TargetKey);
+                        }
+                    }
+                }
+
+                ID_BTN_PICK_POS => {
+                    if notification == BN_CLICKED_U16 {
+                        if ctx.state.rebind_target == RebindTarget::PickLocation {
+                            // Cancel listening
+                            stop_rebind();
+                            ctx.state.rebind_target = RebindTarget::None;
+                            set_control_text(ctx.controls.btn_pick_pos, "Pick");
+                        } else {
+                            // Begin picking location
+                            stop_rebind();
+                            if ctx.state.rebind_target == RebindTarget::Hotkey {
+                                set_control_text(ctx.controls.btn_hotkeys, "Set Hotkey");
+                            } else if ctx.state.rebind_target == RebindTarget::TargetKey {
+                                let name = vk_to_string(ctx.state.target_key as u32);
+                                set_control_text(ctx.controls.btn_key_target, &format!("Key: {}", name));
+                            }
+                            ctx.state.rebind_target = RebindTarget::PickLocation;
+                            set_control_text(ctx.controls.btn_pick_pos, "Click...");
+                            start_pick_location(hwnd);
                         }
                     }
                 }
@@ -397,10 +535,14 @@ unsafe extern "system" fn wnd_proc(
 
                 ID_RADIO_MOUSE | ID_LBL_RADIO_MOUSE => {
                     if notification == BN_CLICKED_U16 {
+                        let current_type = get_click_type_from_combo(ctx.controls.combo_click_type, ctx.state.input_mode);
                         ctx.state.input_mode = 0;
                         button_set_checked(ctx.controls.radio_mouse, true);
                         button_set_checked(ctx.controls.radio_keyboard, false);
                         update_input_visibility(&ctx.controls, 0);
+                        update_click_type_options(ctx.controls.combo_click_type, 0, current_type);
+                        update_location_state(&ctx.controls, 0, ctx.state.location_mode);
+                        set_control_text(ctx.controls.lbl_amount, "Click Amount (0 = forever):");
                         save_current_settings(ctx);
                         InvalidateRect(hwnd, null_mut(), 1);
                     }
@@ -408,22 +550,49 @@ unsafe extern "system" fn wnd_proc(
 
                 ID_RADIO_KEYBOARD | ID_LBL_RADIO_KEYBOARD => {
                     if notification == BN_CLICKED_U16 {
+                        let current_type = get_click_type_from_combo(ctx.controls.combo_click_type, ctx.state.input_mode);
                         ctx.state.input_mode = 1;
                         button_set_checked(ctx.controls.radio_mouse, false);
                         button_set_checked(ctx.controls.radio_keyboard, true);
                         update_input_visibility(&ctx.controls, 1);
+                        update_click_type_options(ctx.controls.combo_click_type, 1, current_type);
+                        update_location_state(&ctx.controls, 1, ctx.state.location_mode);
+                        set_control_text(ctx.controls.lbl_amount, "Press Amount (0 = forever):");
                         save_current_settings(ctx);
                         InvalidateRect(hwnd, null_mut(), 1);
                     }
                 }
 
-                ID_COMBO_RATE_UNIT | ID_COMBO_MOUSE_BTN => {
+                ID_RADIO_LOC_CURRENT | ID_LBL_RADIO_LOC_CURRENT => {
+                    if notification == BN_CLICKED_U16 {
+                        ctx.state.location_mode = 0;
+                        button_set_checked(ctx.controls.radio_loc_current, true);
+                        button_set_checked(ctx.controls.radio_loc_specific, false);
+                        update_location_state(&ctx.controls, ctx.state.input_mode, 0);
+                        save_current_settings(ctx);
+                        InvalidateRect(hwnd, null_mut(), 1);
+                    }
+                }
+
+                ID_RADIO_LOC_SPECIFIC | ID_LBL_RADIO_LOC_SPECIFIC => {
+                    if notification == BN_CLICKED_U16 {
+                        ctx.state.location_mode = 1;
+                        button_set_checked(ctx.controls.radio_loc_current, false);
+                        button_set_checked(ctx.controls.radio_loc_specific, true);
+                        update_location_state(&ctx.controls, ctx.state.input_mode, 1);
+                        save_current_settings(ctx);
+                        InvalidateRect(hwnd, null_mut(), 1);
+                    }
+                }
+
+                ID_COMBO_RATE_UNIT | ID_COMBO_MOUSE_BTN | ID_COMBO_CLICK_TYPE | ID_COMBO_TRIGGER_MODE => {
                     if notification == CBN_SELCHANGE as u16 {
+                        ctx.state.trigger_mode = combobox_get_cursel(ctx.controls.combo_trigger_mode) as u32;
                         save_current_settings(ctx);
                     }
                 }
 
-                ID_EDIT_HR | ID_EDIT_MIN | ID_EDIT_SEC | ID_EDIT_MS | ID_EDIT_RATE | ID_EDIT_AMOUNT => {
+                ID_EDIT_HR | ID_EDIT_MIN | ID_EDIT_SEC | ID_EDIT_MS | ID_EDIT_RATE | ID_EDIT_AMOUNT | ID_EDIT_LOC_X | ID_EDIT_LOC_Y => {
                     if notification == EN_CHANGE as u16 {
                         save_current_settings(ctx);
                     }
@@ -440,14 +609,42 @@ unsafe extern "system" fn wnd_proc(
                 let ctx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowContext;
                 if !ctx_ptr.is_null() {
                     let ctx = &mut *ctx_ptr;
-                    toggle_clicker(hwnd, ctx);
+                    let trigger_mode = combobox_get_cursel(ctx.controls.combo_trigger_mode);
+                    if trigger_mode == 1 {
+                        // Hold mode (hotkey): start if not already running
+                        if !ctx.state.is_running {
+                            start_clicker(hwnd, ctx);
+                        }
+                    } else {
+                        // Toggle mode or HoldMouse mode: toggle start/stop
+                        toggle_clicker(hwnd, ctx);
+                    }
+                }
+            }
+            0
+        }
+
+        WM_TIMER => {
+            let timer_id = wparam as usize;
+            if timer_id == ID_TIMER_HOLD {
+                let ctx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowContext;
+                if !ctx_ptr.is_null() {
+                    let ctx = &mut *ctx_ptr;
+                    if ctx.state.is_running {
+                        let hotkey_down = unsafe {
+                            (windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(ctx.state.hotkey as i32) as u16 & 0x8000) != 0
+                        };
+                        if !hotkey_down {
+                            stop_clicker(hwnd, ctx);
+                        }
+                    }
                 }
             }
             0
         }
 
         WM_APP_STOPPED => {
-            // Click count limit was reached
+            // Click count limit was reached or hold released
             let ctx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowContext;
             if !ctx_ptr.is_null() {
                 let ctx = &mut *ctx_ptr;
@@ -492,13 +689,13 @@ unsafe extern "system" fn wnd_proc(
                         set_control_text(ctx.controls.btn_start, &start_label);
                         save_current_settings(ctx);
                     }
-                    set_control_text(ctx.controls.btn_hotkeys, "Hotkeys");
+                    set_control_text(ctx.controls.btn_hotkeys, "Set Hotkey");
                 } else if target_code == RebindTarget::TargetKey as u32 {
                     if vk != VK_ESCAPE as u32 {
                         // Conflict Prevention: Target Key and Start/Stop hotkey must NOT be the same!
                         if vk == ctx.state.hotkey {
                             MessageBeep(0xFFFFFFFF);
-                            set_control_text(ctx.controls.btn_key_target, "[ Key in use! ]");
+                            set_control_text(ctx.controls.btn_key_target, "Key in use!");
                             // Keep listening for a different key
                             ctx.state.rebind_target = RebindTarget::TargetKey;
                             start_rebind(hwnd, RebindTarget::TargetKey);
@@ -509,8 +706,39 @@ unsafe extern "system" fn wnd_proc(
                         save_current_settings(ctx);
                     }
                     let key_name = vk_to_string(ctx.state.target_key as u32);
-                    set_control_text(ctx.controls.btn_key_target, &format!("[ {} ]", key_name));
+                    set_control_text(ctx.controls.btn_key_target, &format!("Key: {}", key_name));
+                } else if target_code == RebindTarget::PickLocation as u32 {
+                    set_control_text(ctx.controls.btn_pick_pos, "Pick");
+                    InvalidateRect(hwnd, null_mut(), 1);
                 }
+            }
+            0
+        }
+
+        WM_APP_LOCATION_CAPTURED => {
+            let x = wparam as i32;
+            let y = lparam as i32;
+
+            let ctx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowContext;
+            if !ctx_ptr.is_null() {
+                let ctx = &mut *ctx_ptr;
+                stop_rebind();
+                ctx.state.rebind_target = RebindTarget::None;
+                set_control_text(ctx.controls.btn_pick_pos, "Pick");
+
+                ctx.state.target_x = x;
+                ctx.state.target_y = y;
+                set_control_text(ctx.controls.edit_loc_x, &x.to_string());
+                set_control_text(ctx.controls.edit_loc_y, &y.to_string());
+
+                // Auto-switch to Specific location mode upon picking a location
+                ctx.state.location_mode = 1;
+                button_set_checked(ctx.controls.radio_loc_current, false);
+                button_set_checked(ctx.controls.radio_loc_specific, true);
+                update_location_state(&ctx.controls, ctx.state.input_mode, 1);
+
+                save_current_settings(ctx);
+                InvalidateRect(hwnd, null_mut(), 1);
             }
             0
         }
@@ -526,7 +754,9 @@ unsafe extern "system" fn wnd_proc(
                     || ctrl_hwnd == ctx.controls.edit_sec
                     || ctrl_hwnd == ctx.controls.edit_ms
                     || ctrl_hwnd == ctx.controls.edit_rate
-                    || ctrl_hwnd == ctx.controls.edit_amount;
+                    || ctrl_hwnd == ctx.controls.edit_amount
+                    || ctrl_hwnd == ctx.controls.edit_loc_x
+                    || ctrl_hwnd == ctx.controls.edit_loc_y;
 
                 if is_edit {
                     SetBkMode(hdc, 2 /* OPAQUE */);
@@ -576,21 +806,21 @@ unsafe extern "system" fn wnd_proc(
         WM_ACTIVATE => {
             let active_type = (wparam & 0xFFFF) as u16;
             if active_type == WA_INACTIVE as u16 {
-                // If window loses focus while listening, cancel rebind to avoid trapped hooks
+                // If window loses focus while listening for Hotkey or TargetKey, cancel rebind to avoid trapped hooks
                 let ctx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowContext;
                 if !ctx_ptr.is_null() {
                     let ctx = &mut *ctx_ptr;
-                    if ctx.state.rebind_target != RebindTarget::None {
+                    if ctx.state.rebind_target == RebindTarget::Hotkey {
                         stop_rebind();
-                        if ctx.state.rebind_target == RebindTarget::Hotkey {
-                            set_control_text(ctx.controls.btn_hotkeys, "Hotkeys");
-                        } else if ctx.state.rebind_target == RebindTarget::TargetKey {
-                            let key_name = vk_to_string(ctx.state.target_key as u32);
-                            set_control_text(
-                                ctx.controls.btn_key_target,
-                                &format!("[ {} ]", key_name),
-                            );
-                        }
+                        set_control_text(ctx.controls.btn_hotkeys, "Set Hotkey");
+                        ctx.state.rebind_target = RebindTarget::None;
+                    } else if ctx.state.rebind_target == RebindTarget::TargetKey {
+                        stop_rebind();
+                        let key_name = vk_to_string(ctx.state.target_key as u32);
+                        set_control_text(
+                            ctx.controls.btn_key_target,
+                            &format!("Key: {}", key_name),
+                        );
                         ctx.state.rebind_target = RebindTarget::None;
                     }
                 }
@@ -675,13 +905,13 @@ fn main() {
 
         RegisterClassW(&wnd_class);
 
-        // Fixed-size, compact window with client area 460 x 205 px
+        // Fixed-size, compact window with client area 500 x 220 px
         let window_style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
         let mut rect = RECT {
             left: 0,
             top: 0,
-            right: 460,
-            bottom: 205,
+            right: 500,
+            bottom: 220,
         };
         AdjustWindowRectEx(&mut rect, window_style, 0, 0);
 
