@@ -343,7 +343,7 @@ unsafe extern "system" fn wnd_proc(
             let hotkey_name = vk_to_string(settings.hotkey);
             set_control_text(controls.btn_start, &format!("START ({})", hotkey_name));
 
-            combobox_set_cursel(controls.combo_trigger_mode, settings.trigger_mode as usize);
+            update_trigger_mode_options(controls.combo_trigger_mode, settings.input_mode, settings.trigger_mode as usize);
 
             update_timing_visibility(&controls, settings.timing_mode);
             update_input_visibility(&controls, settings.input_mode);
@@ -536,11 +536,14 @@ unsafe extern "system" fn wnd_proc(
                 ID_RADIO_MOUSE | ID_LBL_RADIO_MOUSE => {
                     if notification == BN_CLICKED_U16 {
                         let current_type = get_click_type_from_combo(ctx.controls.combo_click_type, ctx.state.input_mode);
+                        let current_trigger = combobox_get_cursel(ctx.controls.combo_trigger_mode);
                         ctx.state.input_mode = 0;
                         button_set_checked(ctx.controls.radio_mouse, true);
                         button_set_checked(ctx.controls.radio_keyboard, false);
                         update_input_visibility(&ctx.controls, 0);
                         update_click_type_options(ctx.controls.combo_click_type, 0, current_type);
+                        update_trigger_mode_options(ctx.controls.combo_trigger_mode, 0, current_trigger);
+                        ctx.state.trigger_mode = combobox_get_cursel(ctx.controls.combo_trigger_mode) as u32;
                         update_location_state(&ctx.controls, 0, ctx.state.location_mode);
                         set_control_text(ctx.controls.lbl_amount, "Click Amount (0 = forever):");
                         save_current_settings(ctx);
@@ -551,11 +554,14 @@ unsafe extern "system" fn wnd_proc(
                 ID_RADIO_KEYBOARD | ID_LBL_RADIO_KEYBOARD => {
                     if notification == BN_CLICKED_U16 {
                         let current_type = get_click_type_from_combo(ctx.controls.combo_click_type, ctx.state.input_mode);
+                        let current_trigger = combobox_get_cursel(ctx.controls.combo_trigger_mode);
                         ctx.state.input_mode = 1;
                         button_set_checked(ctx.controls.radio_mouse, false);
                         button_set_checked(ctx.controls.radio_keyboard, true);
                         update_input_visibility(&ctx.controls, 1);
                         update_click_type_options(ctx.controls.combo_click_type, 1, current_type);
+                        update_trigger_mode_options(ctx.controls.combo_trigger_mode, 1, current_trigger);
+                        ctx.state.trigger_mode = combobox_get_cursel(ctx.controls.combo_trigger_mode) as u32;
                         update_location_state(&ctx.controls, 1, ctx.state.location_mode);
                         set_control_text(ctx.controls.lbl_amount, "Press Amount (0 = forever):");
                         save_current_settings(ctx);

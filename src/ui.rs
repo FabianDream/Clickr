@@ -307,6 +307,25 @@ pub fn get_click_type_from_combo(combo: HWND, input_mode: u32) -> usize {
     }
 }
 
+/// Dynamically update trigger mode options:
+/// - Mouse mode: "Toggle (Hotkey)", "Hold (Hotkey)", "Hold Mouse Click"
+/// - Keyboard mode: "Toggle (Hotkey)", "Hold (Hotkey)" ("Hold Mouse Click" does not apply to keyboard)
+pub fn update_trigger_mode_options(combo: HWND, input_mode: u32, current_trigger_mode: usize) {
+    unsafe {
+        SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+        combobox_add_string(combo, "Toggle (Hotkey)");
+        combobox_add_string(combo, "Hold (Hotkey)");
+        if input_mode == 0 {
+            combobox_add_string(combo, "Hold Mouse Click");
+            let sel = current_trigger_mode.min(2);
+            combobox_set_cursel(combo, sel);
+        } else {
+            let sel = current_trigger_mode.min(1);
+            combobox_set_cursel(combo, sel);
+        }
+    }
+}
+
 pub unsafe fn create_tooltip(parent: HWND, hinstance: HINSTANCE) -> HWND {
     let tooltip_class = to_wide_null("tooltips_class32");
     let hwnd_tip = CreateWindowExW(
@@ -430,10 +449,7 @@ pub unsafe fn create_controls(
         null_mut(),
     );
 
-    combobox_add_string(combo_trigger_mode, "Toggle (Hotkey)");
-    combobox_add_string(combo_trigger_mode, "Hold (Hotkey)");
-    combobox_add_string(combo_trigger_mode, "Hold Mouse Click");
-    combobox_set_cursel(combo_trigger_mode, 0);
+    update_trigger_mode_options(combo_trigger_mode, 0, 0);
 
     // 2. Row 1 - Timing Mode
     let lbl_timing = CreateWindowExW(
@@ -1454,6 +1470,45 @@ mod tests {
             update_click_type_options(hwnd, 0, 2);
             assert_eq!(combobox_get_cursel(hwnd), 2);
             assert_eq!(get_click_type_from_combo(hwnd, 0), 2);
+
+            DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn test_trigger_mode_options_mapping() {
+        unsafe {
+            let class_name = to_wide_null("COMBOBOX");
+            let hwnd = CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                null_mut(),
+                WS_POPUP | CBS_DROPDOWNLIST_U32,
+                0, 0, 100, 100,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            );
+            assert!(!hwnd.is_null());
+
+            // 1. Mouse mode: Toggle (0), Hold (1), Hold Mouse Click (2) -> 3 items
+            update_trigger_mode_options(hwnd, 0, 2);
+            let count_mouse = SendMessageW(hwnd, CB_GETCOUNT, 0, 0);
+            assert_eq!(count_mouse, 3);
+            assert_eq!(combobox_get_cursel(hwnd), 2);
+
+            // 2. Keyboard mode: Toggle (0), Hold (1) -> 2 items (Hold Mouse Click is removed!)
+            update_trigger_mode_options(hwnd, 1, 2);
+            let count_kbd = SendMessageW(hwnd, CB_GETCOUNT, 0, 0);
+            assert_eq!(count_kbd, 2);
+            assert_eq!(combobox_get_cursel(hwnd), 1); // clamped to 1
+
+            // 3. Switching back to Mouse restores 3 items
+            update_trigger_mode_options(hwnd, 0, 1);
+            let count_back = SendMessageW(hwnd, CB_GETCOUNT, 0, 0);
+            assert_eq!(count_back, 3);
+            assert_eq!(combobox_get_cursel(hwnd), 1);
 
             DestroyWindow(hwnd);
         }
