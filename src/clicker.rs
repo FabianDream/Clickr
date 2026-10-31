@@ -183,11 +183,53 @@ pub fn calculate_interval(
     }
 }
 
+pub const MAPVK_VK_TO_VSC: u32 = 0;
+
+/// Calculate the adaptive key hold duration (down-to-up delay) based on the click interval.
+/// Ensures a natural human press (~20-25ms) for moderate/slow rates,
+/// and scales dynamically (interval / 2) for rapid click rates so Down and Up never collide.
+pub fn calculate_key_hold_duration(interval: Duration) -> Duration {
+    let half = interval / 2;
+    let max_hold = Duration::from_millis(25);
+    half.min(max_hold)
+}
+
+/// Helper to construct a KEYBDINPUT with hardware scan code and appropriate flags.
+pub fn create_keyboard_input(vk: u16, is_up: bool) -> INPUT {
+    unsafe {
+        let scan = MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) as u16;
+        let mut flags = if is_up { KEYEVENTF_KEYUP } else { 0 };
+
+        // Extended keys require KEYEVENTF_EXTENDEDKEY flag
+        if matches!(
+            vk,
+            VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT
+                | VK_INSERT | VK_DELETE | VK_HOME | VK_END | VK_PRIOR | VK_NEXT
+                | VK_RCONTROL | VK_RMENU | VK_DIVIDE | VK_NUMLOCK
+        ) {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
+
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    wScan: scan,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }
+    }
+}
+
 /// Press a target mouse button or keyboard key down (used for Hold click type).
 pub fn press_target_down(target: ClickTarget) {
     unsafe {
         match target {
-            ClickTarget::Mouse(btn, ClickType::Hold) => {
+            ClickTarget::Mouse(btn, _) => {
                 let down_flag = match btn {
                     MouseButton::Left => MOUSEEVENTF_LEFTDOWN,
                     MouseButton::Right => MOUSEEVENTF_RIGHTDOWN,
@@ -208,22 +250,10 @@ pub fn press_target_down(target: ClickTarget) {
                 };
                 SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
             }
-            ClickTarget::Keyboard(vk, ClickType::Hold) => {
-                let input = INPUT {
-                    r#type: INPUT_KEYBOARD,
-                    Anonymous: INPUT_0 {
-                        ki: KEYBDINPUT {
-                            wVk: vk,
-                            wScan: 0,
-                            dwFlags: 0,
-                            time: 0,
-                            dwExtraInfo: 0,
-                        },
-                    },
-                };
+            ClickTarget::Keyboard(vk, _) => {
+                let input = create_keyboard_input(vk, false);
                 SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
             }
-            _ => {}
         }
     }
 }
@@ -232,7 +262,7 @@ pub fn press_target_down(target: ClickTarget) {
 pub fn release_target(target: ClickTarget) {
     unsafe {
         match target {
-            ClickTarget::Mouse(btn, ClickType::Hold) => {
+            ClickTarget::Mouse(btn, _) => {
                 let up_flag = match btn {
                     MouseButton::Left => MOUSEEVENTF_LEFTUP,
                     MouseButton::Right => MOUSEEVENTF_RIGHTUP,
@@ -253,28 +283,30 @@ pub fn release_target(target: ClickTarget) {
                 };
                 SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
             }
-            ClickTarget::Keyboard(vk, ClickType::Hold) => {
-                let input = INPUT {
-                    r#type: INPUT_KEYBOARD,
-                    Anonymous: INPUT_0 {
-                        ki: KEYBDINPUT {
-                            wVk: vk,
-                            wScan: 0,
-                            dwFlags: KEYEVENTF_KEYUP,
-                            time: 0,
-                            dwExtraInfo: 0,
-                        },
-                    },
-                };
+            ClickTarget::Keyboard(vk, _) => {
+                let input = create_keyboard_input(vk, true);
                 SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
             }
-            _ => {}
         }
     }
 }
 
-/// Simulate a single/double click or hold state for mouse or keyboard.
+/// Simulate a single/double click or hold state for mouse or keyboard with default hold time.
 pub fn simulate_click(target: ClickTarget) {
+    simulate_click_responsive(target, Duration::from_millis(20), None);
+}
+
+/// Simulate a single/double click or hold state with a specific hold duration.
+pub fn simulate_click_with_hold(target: ClickTarget, hold_duration: Duration) {
+    simulate_click_responsive(target, hold_duration, None);
+}
+
+/// Simulate click with adaptive down-to-up hold delay and responsive cancellation on worker stop.
+pub fn simulate_click_responsive(
+    target: ClickTarget,
+    hold_duration: Duration,
+    signal: Option<&WorkerSignal>,
+) {
     unsafe {
         match target {
             ClickTarget::Mouse(btn, click_type) => {
@@ -332,44 +364,62 @@ pub fn simulate_click(target: ClickTarget) {
                 }
             }
             ClickTarget::Keyboard(vk, click_type) => {
-                let make_inputs = || [
-                    INPUT {
-                        r#type: INPUT_KEYBOARD,
-                        Anonymous: INPUT_0 {
-                            ki: KEYBDINPUT {
-                                wVk: vk,
-                                wScan: 0,
-                                dwFlags: 0,
-                                time: 0,
-                                dwExtraInfo: 0,
-                            },
-                        },
-                    },
-                    INPUT {
-                        r#type: INPUT_KEYBOARD,
-                        Anonymous: INPUT_0 {
-                            ki: KEYBDINPUT {
-                                wVk: vk,
-                                wScan: 0,
-                                dwFlags: KEYEVENTF_KEYUP,
-                                time: 0,
-                                dwExtraInfo: 0,
-                            },
-                        },
-                    },
-                ];
-
                 match click_type {
                     ClickType::Single => {
-                        let inputs = make_inputs();
-                        SendInput(2, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+                        // 1. Send Key Down (with hardware scan code)
+                        let down = create_keyboard_input(vk, false);
+                        SendInput(1, &down, std::mem::size_of::<INPUT>() as i32);
+
+                        // 2. Realistic Hold Duration so OS, DirectInput, and games register the Down state
+                        if hold_duration > Duration::ZERO {
+                            if let Some(sig) = signal {
+                                if sig.running.load(Ordering::Relaxed) {
+                                    let lock = sig.mutex.lock().unwrap();
+                                    let _ = sig.condvar.wait_timeout(lock, hold_duration);
+                                }
+                            } else {
+                                std::thread::sleep(hold_duration);
+                            }
+                        }
+
+                        // 3. Send Key Up (with hardware scan code)
+                        let up = create_keyboard_input(vk, true);
+                        SendInput(1, &up, std::mem::size_of::<INPUT>() as i32);
                     }
                     ClickType::Double => {
-                        let inputs1 = make_inputs();
-                        SendInput(2, inputs1.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+                        // First stroke: Down -> Hold -> Up
+                        let down1 = create_keyboard_input(vk, false);
+                        SendInput(1, &down1, std::mem::size_of::<INPUT>() as i32);
+                        if hold_duration > Duration::ZERO {
+                            if let Some(sig) = signal {
+                                if sig.running.load(Ordering::Relaxed) {
+                                    let lock = sig.mutex.lock().unwrap();
+                                    let _ = sig.condvar.wait_timeout(lock, hold_duration);
+                                }
+                            } else {
+                                std::thread::sleep(hold_duration);
+                            }
+                        }
+                        let up1 = create_keyboard_input(vk, true);
+                        SendInput(1, &up1, std::mem::size_of::<INPUT>() as i32);
+
                         std::thread::sleep(Duration::from_millis(15));
-                        let inputs2 = make_inputs();
-                        SendInput(2, inputs2.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+
+                        // Second stroke: Down -> Hold -> Up
+                        let down2 = create_keyboard_input(vk, false);
+                        SendInput(1, &down2, std::mem::size_of::<INPUT>() as i32);
+                        if hold_duration > Duration::ZERO {
+                            if let Some(sig) = signal {
+                                if sig.running.load(Ordering::Relaxed) {
+                                    let lock = sig.mutex.lock().unwrap();
+                                    let _ = sig.condvar.wait_timeout(lock, hold_duration);
+                                }
+                            } else {
+                                std::thread::sleep(hold_duration);
+                            }
+                        }
+                        let up2 = create_keyboard_input(vk, true);
+                        SendInput(1, &up2, std::mem::size_of::<INPUT>() as i32);
                     }
                     ClickType::Hold => {
                         press_target_down(target);
@@ -388,8 +438,10 @@ pub fn run_worker_loop(
     signal: Arc<WorkerSignal>,
     config: ClickerConfig,
 ) {
-    run_worker_loop_internal(hwnd_raw, signal, config, |target| {
-        simulate_click(target);
+    let hold_duration = calculate_key_hold_duration(config.interval);
+    let sig = signal.clone();
+    run_worker_loop_internal(hwnd_raw, signal, config, move |target| {
+        simulate_click_responsive(target, hold_duration, Some(&sig));
     });
 }
 
@@ -426,7 +478,9 @@ pub fn run_worker_loop_internal<F: FnMut(ClickTarget)>(
 
     // Immediately press down target if Hold click type and NOT in HoldMouse mode
     if config.trigger_mode != TriggerMode::HoldMouse {
-        press_target_down(config.target);
+        if matches!(config.target, ClickTarget::Mouse(_, ClickType::Hold) | ClickTarget::Keyboard(_, ClickType::Hold)) {
+            press_target_down(config.target);
+        }
     }
 
     while signal.running.load(Ordering::Relaxed) {
@@ -1072,5 +1126,107 @@ mod tests {
         set_physical_mouse_down(false);
         signal.stop();
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_calculate_key_hold_duration_adaptive() {
+        // High CPS: 100 CPS (10ms) -> 5ms hold
+        assert_eq!(
+            calculate_key_hold_duration(Duration::from_millis(10)),
+            Duration::from_millis(5)
+        );
+
+        // Medium CPS: 50 CPS (20ms) -> 10ms hold
+        assert_eq!(
+            calculate_key_hold_duration(Duration::from_millis(20)),
+            Duration::from_millis(10)
+        );
+
+        // Low CPS: 20 CPS (50ms) -> 25ms cap
+        assert_eq!(
+            calculate_key_hold_duration(Duration::from_millis(50)),
+            Duration::from_millis(25)
+        );
+
+        // Normal typing rate: 10 CPS (100ms) -> 25ms natural hold
+        assert_eq!(
+            calculate_key_hold_duration(Duration::from_millis(100)),
+            Duration::from_millis(25)
+        );
+
+        // Very slow rate: 1 CPS (1000ms) -> 25ms natural hold
+        assert_eq!(
+            calculate_key_hold_duration(Duration::from_millis(1000)),
+            Duration::from_millis(25)
+        );
+
+        // Extreme fast: 2ms -> 1ms hold
+        assert_eq!(
+            calculate_key_hold_duration(Duration::from_millis(2)),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn test_create_keyboard_input_hardware_scancode_and_flags() {
+        unsafe {
+            // Standard key: VK_SPACE
+            let down = create_keyboard_input(VK_SPACE, false);
+            assert_eq!(down.r#type, INPUT_KEYBOARD);
+            assert_eq!(down.Anonymous.ki.wVk, VK_SPACE);
+            assert_ne!(down.Anonymous.ki.wScan, 0, "Hardware scan code must be non-zero for Space");
+            assert_eq!(down.Anonymous.ki.dwFlags, 0, "Key Down must not have KEYUP flag");
+
+            let up = create_keyboard_input(VK_SPACE, true);
+            assert_eq!(up.r#type, INPUT_KEYBOARD);
+            assert_eq!(up.Anonymous.ki.wVk, VK_SPACE);
+            assert_eq!(up.Anonymous.ki.wScan, down.Anonymous.ki.wScan, "Scan code must match on Down and Up");
+            assert_eq!(up.Anonymous.ki.dwFlags & KEYEVENTF_KEYUP, KEYEVENTF_KEYUP, "Key Up must have KEYUP flag");
+
+            // Extended key: VK_UP arrow
+            let ext_down = create_keyboard_input(VK_UP, false);
+            assert_eq!(ext_down.Anonymous.ki.wVk, VK_UP);
+            assert_eq!(
+                ext_down.Anonymous.ki.dwFlags & KEYEVENTF_EXTENDEDKEY,
+                KEYEVENTF_EXTENDEDKEY,
+                "Extended key must have KEYEVENTF_EXTENDEDKEY flag"
+            );
+
+            let ext_up = create_keyboard_input(VK_UP, true);
+            assert_eq!(
+                ext_up.Anonymous.ki.dwFlags & (KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY),
+                KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY,
+                "Extended Key Up must have both KEYUP and EXTENDEDKEY flags"
+            );
+        }
+    }
+
+    #[test]
+    fn test_simulate_click_responsive_cancellation() {
+        let signal = Arc::new(WorkerSignal::new());
+        let sig_clone = signal.clone();
+
+        // Spawn a thread simulating a 500ms hold keypress
+        let handle = std::thread::spawn(move || {
+            let start = Instant::now();
+            simulate_click_responsive(
+                ClickTarget::Keyboard(VK_SPACE, ClickType::Single),
+                Duration::from_millis(500),
+                Some(&sig_clone),
+            );
+            start.elapsed()
+        });
+
+        // Sleep briefly and then trigger stop signal
+        std::thread::sleep(Duration::from_millis(20));
+        signal.stop();
+
+        let elapsed = handle.join().expect("Thread panicked");
+        // Verify it aborted immediately rather than waiting the full 500ms
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "Hold wait should have aborted immediately upon stop signal, elapsed: {:?}",
+            elapsed
+        );
     }
 }
