@@ -34,8 +34,6 @@ extern "system" {
     ) -> i32;
 }
 
-const ID_TIMER_HOLD: usize = 2001;
-
 struct WindowContext {
     hwnd: HWND,
     state: AppState,
@@ -240,13 +238,6 @@ fn start_clicker(hwnd: HWND, ctx: &mut WindowContext) {
     ctx.state.worker_signal = Some(signal.clone());
     ctx.state.is_running = true;
 
-    // In Hold trigger mode, arm a 15ms timer to quickly detect hotkey release on UI thread
-    if trigger_mode == TriggerMode::Hold {
-        unsafe {
-            SetTimer(hwnd, ID_TIMER_HOLD, 15, None);
-        }
-    }
-
     // In HoldMouse trigger mode, monitor physical mouse button down/up via low-level hook
     if trigger_mode == TriggerMode::HoldMouse {
         let btn_to_monitor = if ctx.state.input_mode == 0 {
@@ -280,9 +271,6 @@ fn stop_clicker(hwnd: HWND, ctx: &mut WindowContext) {
         return;
     }
 
-    unsafe {
-        KillTimer(hwnd, ID_TIMER_HOLD);
-    }
     stop_mouse_hold_monitor();
 
     ctx.state.is_running = false;
@@ -291,9 +279,7 @@ fn stop_clicker(hwnd: HWND, ctx: &mut WindowContext) {
         signal.stop();
     }
 
-    if let Some(target) = ctx.state.current_target.take() {
-        release_target(target);
-    }
+    ctx.state.current_target = None;
 
     // Update UI
     let hotkey_name = vk_to_string(ctx.state.hotkey);
@@ -414,6 +400,11 @@ unsafe extern "system" fn wnd_proc(
             });
 
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(ctx) as isize);
+
+            let mut rc: RECT = std::mem::zeroed();
+            GetWindowRect(hwnd, &mut rc);
+            update_window_bounds(rc.left, rc.top, rc.right, rc.bottom);
+
             0
         }
 
@@ -426,6 +417,7 @@ unsafe extern "system" fn wnd_proc(
                     GetWindowRect(hwnd, &mut rc);
                     ctx.state.pos_x = rc.left;
                     ctx.state.pos_y = rc.top;
+                    update_window_bounds(rc.left, rc.top, rc.right, rc.bottom);
                 }
             }
             0
@@ -639,7 +631,7 @@ unsafe extern "system" fn wnd_proc(
                 }
 
                 ID_EDIT_HR | ID_EDIT_MIN | ID_EDIT_SEC | ID_EDIT_MS | ID_EDIT_RATE | ID_EDIT_AMOUNT | ID_EDIT_LOC_X | ID_EDIT_LOC_Y => {
-                    if notification == EN_CHANGE as u16 {
+                    if notification == EN_KILLFOCUS as u16 {
                         save_current_settings(ctx);
                     }
                 }
@@ -664,25 +656,6 @@ unsafe extern "system" fn wnd_proc(
                     } else {
                         // Toggle mode or HoldMouse mode: toggle start/stop
                         toggle_clicker(hwnd, ctx);
-                    }
-                }
-            }
-            0
-        }
-
-        WM_TIMER => {
-            let timer_id = wparam as usize;
-            if timer_id == ID_TIMER_HOLD {
-                let ctx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowContext;
-                if !ctx_ptr.is_null() {
-                    let ctx = &mut *ctx_ptr;
-                    if ctx.state.is_running {
-                        let hotkey_down = unsafe {
-                            (windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(ctx.state.hotkey as i32) as u16 & 0x8000) != 0
-                        };
-                        if !hotkey_down {
-                            stop_clicker(hwnd, ctx);
-                        }
                     }
                 }
             }
@@ -1042,6 +1015,10 @@ fn main() {
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
 
+        let mut initial_rc: RECT = std::mem::zeroed();
+        GetWindowRect(hwnd, &mut initial_rc);
+        update_window_bounds(initial_rc.left, initial_rc.top, initial_rc.right, initial_rc.bottom);
+
         // Native Windows message loop: 0.0% CPU and 0.0% GPU when idle
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
@@ -1050,5 +1027,7 @@ fn main() {
                 DispatchMessageW(&msg);
             }
         }
+
+        DeleteObject(bg_brush);
     }
 }

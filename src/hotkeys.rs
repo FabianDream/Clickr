@@ -116,10 +116,10 @@ unsafe extern "system" fn low_level_keyboard_proc(
 ) -> LRESULT {
     if code >= 0 && (wparam as u32 == WM_KEYDOWN || wparam as u32 == WM_SYSKEYDOWN) {
         let kbd = &*(lparam as *const KBDLLHOOKSTRUCT);
-        let target = REBIND_TARGET.load(Ordering::SeqCst);
+        let target = REBIND_TARGET.load(Ordering::Acquire);
 
         if target == RebindTarget::PickLocation as u32 {
-            let hwnd = TARGET_HWND.load(Ordering::SeqCst) as HWND;
+            let hwnd = TARGET_HWND.load(Ordering::Acquire) as HWND;
             if hwnd != null_mut() {
                 if kbd.vkCode == VK_ESCAPE as u32 {
                     // Cancel pick location
@@ -146,7 +146,7 @@ unsafe extern "system" fn low_level_keyboard_proc(
         } else if target != 0 {
             // Ignore lone modifier keys like pressing Shift by itself
             if !is_lone_modifier(kbd.vkCode) {
-                let hwnd = TARGET_HWND.load(Ordering::SeqCst) as HWND;
+                let hwnd = TARGET_HWND.load(Ordering::Acquire) as HWND;
                 if hwnd != null_mut() {
                     PostMessageW(
                         hwnd,
@@ -173,10 +173,10 @@ unsafe extern "system" fn low_level_mouse_proc(
     if code >= 0 {
         let msg = wparam as u32;
         if msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN {
-            let target = REBIND_TARGET.load(Ordering::SeqCst);
+            let target = REBIND_TARGET.load(Ordering::Acquire);
             if target == RebindTarget::PickLocation as u32 {
                 let mouse = &*(lparam as *const MSLLHOOKSTRUCT);
-                let hwnd = TARGET_HWND.load(Ordering::SeqCst) as HWND;
+                let hwnd = TARGET_HWND.load(Ordering::Acquire) as HWND;
                 if hwnd != null_mut() {
                     let wnd = WindowFromPoint(mouse.pt);
                     let root = GetAncestor(wnd, GA_ROOT);
@@ -210,8 +210,8 @@ unsafe extern "system" fn low_level_mouse_proc(
 pub fn start_rebind(hwnd: HWND, target: RebindTarget) {
     stop_rebind(); // Clean up any existing hook
 
-    REBIND_TARGET.store(target as u32, Ordering::SeqCst);
-    TARGET_HWND.store(hwnd as isize, Ordering::SeqCst);
+    REBIND_TARGET.store(target as u32, Ordering::Release);
+    TARGET_HWND.store(hwnd as isize, Ordering::Release);
 
     unsafe {
         let hook = SetWindowsHookExW(
@@ -220,7 +220,7 @@ pub fn start_rebind(hwnd: HWND, target: RebindTarget) {
             null_mut(),
             0,
         );
-        HOOK_HANDLE.store(hook as isize, Ordering::SeqCst);
+        HOOK_HANDLE.store(hook as isize, Ordering::Release);
     }
 }
 
@@ -228,8 +228,8 @@ pub fn start_rebind(hwnd: HWND, target: RebindTarget) {
 pub fn start_pick_location(hwnd: HWND) {
     stop_rebind();
 
-    REBIND_TARGET.store(RebindTarget::PickLocation as u32, Ordering::SeqCst);
-    TARGET_HWND.store(hwnd as isize, Ordering::SeqCst);
+    REBIND_TARGET.store(RebindTarget::PickLocation as u32, Ordering::Release);
+    TARGET_HWND.store(hwnd as isize, Ordering::Release);
 
     unsafe {
         let kbd_hook = SetWindowsHookExW(
@@ -238,7 +238,7 @@ pub fn start_pick_location(hwnd: HWND) {
             null_mut(),
             0,
         );
-        HOOK_HANDLE.store(kbd_hook as isize, Ordering::SeqCst);
+        HOOK_HANDLE.store(kbd_hook as isize, Ordering::Release);
 
         let mouse_hook = SetWindowsHookExW(
             WH_MOUSE_LL,
@@ -246,20 +246,20 @@ pub fn start_pick_location(hwnd: HWND) {
             null_mut(),
             0,
         );
-        MOUSE_HOOK_HANDLE.store(mouse_hook as isize, Ordering::SeqCst);
+        MOUSE_HOOK_HANDLE.store(mouse_hook as isize, Ordering::Release);
     }
 }
 
 /// Stop capturing key presses / mouse clicks and unhook any active low-level hooks.
 pub fn stop_rebind() {
-    REBIND_TARGET.store(0, Ordering::SeqCst);
-    let hook = HOOK_HANDLE.swap(0, Ordering::SeqCst) as HHOOK;
+    REBIND_TARGET.store(0, Ordering::Release);
+    let hook = HOOK_HANDLE.swap(0, Ordering::AcqRel) as HHOOK;
     if hook != null_mut() {
         unsafe {
             UnhookWindowsHookEx(hook);
         }
     }
-    let mouse_hook = MOUSE_HOOK_HANDLE.swap(0, Ordering::SeqCst) as HHOOK;
+    let mouse_hook = MOUSE_HOOK_HANDLE.swap(0, Ordering::AcqRel) as HHOOK;
     if mouse_hook != null_mut() {
         unsafe {
             UnhookWindowsHookEx(mouse_hook);
@@ -288,12 +288,12 @@ unsafe extern "system" fn mouse_monitor_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if code >= 0 && MOUSE_MONITOR_ACTIVE.load(Ordering::Relaxed) {
+    if code >= 0 && MOUSE_MONITOR_ACTIVE.load(Ordering::Acquire) {
         let mouse = &*(lparam as *const MSLLHOOKSTRUCT);
         // LLMHF_INJECTED is bit 0 of flags. If 0, event originated from real physical mouse hardware!
         if (mouse.flags & 1) == 0 {
             let msg = wparam as u32;
-            let btn = MOUSE_MONITOR_BTN.load(Ordering::Relaxed);
+            let btn = MOUSE_MONITOR_BTN.load(Ordering::Acquire);
             let (down_msg, up_msg) = match btn {
                 1 => (WM_RBUTTONDOWN, WM_RBUTTONUP),
                 2 => (WM_MBUTTONDOWN, WM_MBUTTONUP),
@@ -304,6 +304,7 @@ unsafe extern "system" fn mouse_monitor_proc(
                 crate::clicker::set_physical_mouse_down(true);
                 if let Ok(sig_guard) = MOUSE_MONITOR_SIGNAL.lock() {
                     if let Some(ref signal) = *sig_guard {
+                        let _guard = signal.mutex.lock();
                         signal.condvar.notify_all();
                     }
                 }
@@ -311,6 +312,7 @@ unsafe extern "system" fn mouse_monitor_proc(
                 crate::clicker::set_physical_mouse_down(false);
                 if let Ok(sig_guard) = MOUSE_MONITOR_SIGNAL.lock() {
                     if let Some(ref signal) = *sig_guard {
+                        let _guard = signal.mutex.lock();
                         signal.condvar.notify_all();
                     }
                 }
@@ -324,11 +326,11 @@ unsafe extern "system" fn mouse_monitor_proc(
 /// Begin monitoring physical mouse button down/up for HoldMouse trigger mode.
 pub fn start_mouse_hold_monitor(btn: u32, signal: Arc<WorkerSignal>) {
     stop_mouse_hold_monitor();
-    MOUSE_MONITOR_BTN.store(btn, Ordering::SeqCst);
+    MOUSE_MONITOR_BTN.store(btn, Ordering::Release);
     if let Ok(mut sig) = MOUSE_MONITOR_SIGNAL.lock() {
         *sig = Some(signal);
     }
-    MOUSE_MONITOR_ACTIVE.store(true, Ordering::SeqCst);
+    MOUSE_MONITOR_ACTIVE.store(true, Ordering::Release);
 
     // Check initial physical state of the button
     let vkey = match btn {
@@ -346,20 +348,21 @@ pub fn start_mouse_hold_monitor(btn: u32, signal: Arc<WorkerSignal>) {
             null_mut(),
             0,
         );
-        MOUSE_MONITOR_HOOK.store(hook as isize, Ordering::SeqCst);
+        MOUSE_MONITOR_HOOK.store(hook as isize, Ordering::Release);
     }
 }
 
 /// Stop monitoring physical mouse button and remove low-level mouse hook.
 pub fn stop_mouse_hold_monitor() {
-    MOUSE_MONITOR_ACTIVE.store(false, Ordering::SeqCst);
+    MOUSE_MONITOR_ACTIVE.store(false, Ordering::Release);
     crate::clicker::set_physical_mouse_down(false);
     if let Ok(mut sig) = MOUSE_MONITOR_SIGNAL.lock() {
         if let Some(signal) = sig.take() {
+            let _guard = signal.mutex.lock();
             signal.condvar.notify_all();
         }
     }
-    let hook = MOUSE_MONITOR_HOOK.swap(0, Ordering::SeqCst) as HHOOK;
+    let hook = MOUSE_MONITOR_HOOK.swap(0, Ordering::AcqRel) as HHOOK;
     if hook != null_mut() {
         unsafe {
             UnhookWindowsHookEx(hook);
@@ -417,11 +420,11 @@ mod tests {
     fn test_mouse_hold_monitor_lifecycle() {
         let signal = Arc::new(WorkerSignal::new());
         start_mouse_hold_monitor(0, signal.clone());
-        assert!(MOUSE_MONITOR_ACTIVE.load(Ordering::SeqCst));
-        assert_eq!(MOUSE_MONITOR_BTN.load(Ordering::SeqCst), 0);
+        assert!(MOUSE_MONITOR_ACTIVE.load(Ordering::Acquire));
+        assert_eq!(MOUSE_MONITOR_BTN.load(Ordering::Acquire), 0);
 
         stop_mouse_hold_monitor();
-        assert!(!MOUSE_MONITOR_ACTIVE.load(Ordering::SeqCst));
+        assert!(!MOUSE_MONITOR_ACTIVE.load(Ordering::Acquire));
         assert!(!crate::clicker::is_physical_mouse_down());
     }
 }

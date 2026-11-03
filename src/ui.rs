@@ -212,12 +212,23 @@ pub fn get_control_text(hwnd: HWND) -> String {
         if len <= 0 {
             return String::new();
         }
-        let mut buf = vec![0u16; (len + 1) as usize];
-        let copied = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
-        if copied > 0 {
-            String::from_utf16_lossy(&buf[..copied as usize])
+        let needed = (len + 1) as usize;
+        if needed <= 64 {
+            let mut buf = [0u16; 64];
+            let copied = GetWindowTextW(hwnd, buf.as_mut_ptr(), 64);
+            if copied > 0 {
+                String::from_utf16_lossy(&buf[..copied as usize])
+            } else {
+                String::new()
+            }
         } else {
-            String::new()
+            let mut buf = vec![0u16; needed];
+            let copied = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+            if copied > 0 {
+                String::from_utf16_lossy(&buf[..copied as usize])
+            } else {
+                String::new()
+            }
         }
     }
 }
@@ -352,7 +363,6 @@ pub unsafe fn add_tooltip(hwnd_tip: HWND, parent: HWND, ctrl_hwnd: HWND, text: &
     ti.uId = ctrl_hwnd as usize;
     ti.lpszText = text_wide.as_ptr() as *mut u16;
     SendMessageW(hwnd_tip, TTM_ADDTOOLW, 0, &ti as *const _ as LPARAM);
-    std::mem::forget(text_wide); // Retain string buffer for tooltip lifecycle
 }
 
 pub unsafe fn create_ui_fonts() -> (HFONT, HFONT) {
@@ -1137,7 +1147,8 @@ pub unsafe fn create_controls(
 /// Draw subtle, elegant Zinc-700 borders around each visible edit control.
 /// Eliminates the stark white 3D sunken borders completely.
 pub unsafe fn draw_ui_borders(hdc: HDC, parent: HWND, controls: &Controls) {
-    let pen = CreatePen(PS_SOLID as i32, 1, COLOR_BORDER_SUBTLE);
+    let pen = GetStockObject(DC_PEN as i32);
+    SetDCPenColor(hdc, COLOR_BORDER_SUBTLE);
     let old_pen = SelectObject(hdc, pen);
     let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH as i32));
 
@@ -1168,7 +1179,6 @@ pub unsafe fn draw_ui_borders(hdc: HDC, parent: HWND, controls: &Controls) {
 
     SelectObject(hdc, old_brush);
     SelectObject(hdc, old_pen);
-    DeleteObject(pen);
 }
 
 /// Owner-drawn button renderer for modern dark mode buttons.
@@ -1185,9 +1195,9 @@ pub unsafe fn draw_custom_button(
     let is_disabled = (dis.itemState & ODS_DISABLED) != 0;
 
     // 1. Flood-fill entire button rect with parent background color first!
-    let bg_brush = CreateSolidBrush(COLOR_BG);
-    FillRect(hdc, &rc, bg_brush);
-    DeleteObject(bg_brush);
+    let brush = GetStockObject(DC_BRUSH as i32);
+    SetDCBrushColor(hdc, COLOR_BG);
+    FillRect(hdc, &rc, brush as HBRUSH);
 
     let (bg_color, border_color, text_color, use_bold) = match dis.CtlID as usize {
         ID_BTN_START => {
@@ -1254,19 +1264,18 @@ pub unsafe fn draw_custom_button(
         _ => return,
     };
 
-    let hpen = CreatePen(PS_SOLID as i32, 1, border_color);
-    let hbrush = CreateSolidBrush(bg_color);
+    let pen = GetStockObject(DC_PEN as i32);
+    SetDCPenColor(hdc, border_color);
+    SetDCBrushColor(hdc, bg_color);
 
-    let old_pen = SelectObject(hdc, hpen);
-    let old_brush = SelectObject(hdc, hbrush);
+    let old_pen = SelectObject(hdc, pen);
+    let old_brush = SelectObject(hdc, brush);
 
     // Crisp rounded rectangle with 6px corner radius
     RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 6, 6);
 
     SelectObject(hdc, old_brush);
     SelectObject(hdc, old_pen);
-    DeleteObject(hbrush);
-    DeleteObject(hpen);
 
     // Draw text centered
     let mut text_buf = [0u16; 128];

@@ -51,14 +51,17 @@ impl Default for AppSettings {
     }
 }
 
-fn get_config_path() -> PathBuf {
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        let dir = PathBuf::from(appdata).join("Clickr");
-        let _ = fs::create_dir_all(&dir);
-        dir.join("settings.ini")
-    } else {
-        PathBuf::from("clickr_settings.ini")
-    }
+fn get_config_path() -> &'static std::path::Path {
+    static CONFIG_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    CONFIG_PATH.get_or_init(|| {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let dir = PathBuf::from(appdata).join("Clickr");
+            let _ = fs::create_dir_all(&dir);
+            dir.join("settings.ini")
+        } else {
+            PathBuf::from("clickr_settings.ini")
+        }
+    })
 }
 
 pub fn load_settings() -> AppSettings {
