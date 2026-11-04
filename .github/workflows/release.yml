@@ -1,17 +1,31 @@
 name: Build & Release
 
 on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - custom
+      custom_version:
+        description: 'Specific version if "custom" selected (e.g. 1.2.0)'
+        required: false
+        default: ''
+      notes:
+        description: 'Release notes (optional - leave blank for auto-generated notes)'
+        required: false
+        default: ''
   push:
     tags:
       - 'v*'
   release:
     types: [published]
-  workflow_dispatch:
-    inputs:
-      tag_name:
-        description: 'Tag name (e.g. v1.1.0)'
-        required: false
-        default: 'v1.1.0'
 
 permissions:
   contents: write
@@ -24,9 +38,83 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Determine Version & Tag
+        id: versioning
+        shell: pwsh
+        run: |
+          $isDispatch = "${{ github.event_name }}" -eq "workflow_dispatch"
+          $isRelease = "${{ github.event_name }}" -eq "release"
+
+          if ($isDispatch) {
+            $content = Get-Content Cargo.toml -Raw
+            if ($content -match '(?m)^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"') {
+              $major = [int]$matches[1]
+              $minor = [int]$matches[2]
+              $patch = [int]$matches[3]
+
+              $bump = "${{ inputs.bump }}"
+              $custom = "${{ inputs.custom_version }}".Trim().TrimStart('v').TrimStart('V')
+
+              if ($bump -eq "custom" -and $custom -ne "") {
+                $newVer = $custom
+              } elseif ($bump -eq "major") {
+                $major++
+                $minor = 0
+                $patch = 0
+                $newVer = "$major.$minor.$patch"
+              } elseif ($bump -eq "minor") {
+                $minor++
+                $patch = 0
+                $newVer = "$major.$minor.$patch"
+              } else {
+                # patch
+                $patch++
+                $newVer = "$major.$minor.$patch"
+              }
+
+              $newTag = "v$newVer"
+              Write-Host "Target version: $newVer ($newTag)"
+
+              # Check if tag already exists
+              $existingTag = git tag -l $newTag
+              if ($existingTag) {
+                throw "Tag $newTag already exists! If you already released this, choose a different version."
+              }
+
+              # Update Cargo.toml
+              $newContent = $content -replace '(?m)^version\s*=\s*"\d+\.\d+\.\d+"', "version = `"$newVer`""
+              Set-Content -Path Cargo.toml -Value $newContent -NoNewline
+
+              # Sync Cargo.lock
+              cargo check --quiet
+
+              # Commit and push version bump and tag
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git add Cargo.toml Cargo.lock
+              git commit -m "chore: release $newTag [skip ci]"
+              git tag $newTag
+              git push origin ${{ github.ref_name }} --tags
+
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "tag=$newTag" -Encoding utf8
+            } else {
+              throw "Failed to extract current version from Cargo.toml"
+            }
+          } elseif ($isRelease) {
+            $tag = "${{ github.event.release.tag_name }}"
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "tag=$tag" -Encoding utf8
+          } else {
+            $tag = "${{ github.ref_name }}"
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "tag=$tag" -Encoding utf8
+          }
 
       - name: Build Release Binary
         run: cargo build --release
@@ -34,28 +122,24 @@ jobs:
       - name: Prepare Binary
         run: Copy-Item target\release\clickr.exe Clickr.exe
 
-      - name: Upload to Release
+      - name: Publish Release
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-          INPUT_TAG: ${{ inputs.tag_name }}
-          REF_NAME: ${{ github.ref_name }}
+          TAG: ${{ steps.versioning.outputs.tag }}
+          CUSTOM_NOTES: ${{ inputs.notes }}
         run: |
-          $TAG = if ($env:RELEASE_TAG) {
-            $env:RELEASE_TAG
-          } elseif ($env:INPUT_TAG) {
-            $env:INPUT_TAG
-          } else {
-            $env:REF_NAME
-          }
+          Write-Host "Publishing release for $env:TAG..."
 
-          Write-Host "Target tag is: $TAG"
-
-          $exists = gh release view $TAG --json id -q ".id" 2>$null
+          $exists = gh release view $env:TAG --json id -q ".id" 2>$null
           if ($exists) {
-            Write-Host "Found existing release $TAG. Uploading Clickr.exe..."
-            gh release upload $TAG Clickr.exe --clobber
+            Write-Host "Release $env:TAG already exists. Uploading Clickr.exe..."
+            gh release upload $env:TAG Clickr.exe --clobber
           } else {
-            Write-Host "Creating release $TAG and uploading Clickr.exe..."
-            gh release create $TAG Clickr.exe --title "$TAG" --generate-notes
+            Write-Host "Creating release $env:TAG and uploading Clickr.exe..."
+            if ($env:CUSTOM_NOTES -and $env:CUSTOM_NOTES.Trim() -ne "") {
+              gh release create $env:TAG Clickr.exe --title "$env:TAG" --notes "$env:CUSTOM_NOTES"
+            } else {
+              gh release create $env:TAG Clickr.exe --title "$env:TAG" --generate-notes
+            }
           }
