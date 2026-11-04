@@ -11,6 +11,7 @@ use std::sync::Arc;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
 use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -307,6 +308,13 @@ fn toggle_clicker(hwnd: HWND, ctx: &mut WindowContext) {
     }
 }
 
+/// Flush unused pages from the process working set back to the OS.
+pub fn trim_working_set() {
+    unsafe {
+        SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+}
+
 fn trigger_update_check(hwnd: HWND, ctx: &mut WindowContext, is_manual: bool) {
     if matches!(ctx.state.update_status, UpdateStatus::Checking | UpdateStatus::Downloading) {
         return;
@@ -338,6 +346,8 @@ fn trigger_update_check(hwnd: HWND, ctx: &mut WindowContext, is_manual: bool) {
                 }
             }
         }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        trim_working_set();
     });
 }
 
@@ -1233,6 +1243,8 @@ fn main() {
                     }
                 }
             }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            trim_working_set();
         });
 
         let mut initial_rc: RECT = std::mem::zeroed();
@@ -1251,3 +1263,4 @@ fn main() {
         DeleteObject(bg_brush);
     }
 }
+
