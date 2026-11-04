@@ -110,6 +110,7 @@ pub struct AppState {
     pub target_y: i32,
     pub pos_x: i32,
     pub pos_y: i32,
+    pub update_status: crate::updater::UpdateStatus,
 }
 
 impl Default for AppState {
@@ -129,6 +130,7 @@ impl Default for AppState {
             target_y: 0,
             pos_x: -1,
             pos_y: -1,
+            update_status: crate::updater::UpdateStatus::Idle,
         }
     }
 }
@@ -1146,34 +1148,27 @@ pub unsafe fn create_controls(
 
 /// Draw subtle, elegant Zinc-700 borders around each visible edit control.
 /// Eliminates the stark white 3D sunken borders completely.
-pub unsafe fn draw_ui_borders(hdc: HDC, parent: HWND, controls: &Controls) {
+pub unsafe fn draw_ui_borders(hdc: HDC, _parent: HWND, controls: &Controls) {
     let pen = GetStockObject(DC_PEN as i32);
     SetDCPenColor(hdc, COLOR_BORDER_SUBTLE);
     let old_pen = SelectObject(hdc, pen);
     let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH as i32));
 
     let edit_list = [
-        controls.edit_hr,
-        controls.edit_min,
-        controls.edit_sec,
-        controls.edit_ms,
-        controls.edit_rate,
-        controls.edit_amount,
-        controls.edit_loc_x,
-        controls.edit_loc_y,
+        (controls.edit_hr, 12, 82, 38, 24),
+        (controls.edit_min, 80, 82, 38, 24),
+        (controls.edit_sec, 160, 82, 38, 24),
+        (controls.edit_ms, 236, 82, 54, 24),
+        (controls.edit_rate, 12, 82, 65, 24),
+        (controls.edit_amount, 232, 184, 75, 24),
+        (controls.edit_loc_x, 266, 150, 46, 24),
+        (controls.edit_loc_y, 336, 150, 46, 24),
     ];
 
-    for &edit in &edit_list {
+    for (edit, x, y, w, h) in edit_list {
         if IsWindowVisible(edit) != 0 {
-            let mut rc: RECT = std::mem::zeroed();
-            GetWindowRect(edit, &mut rc);
-            let mut pt_tl = POINT { x: rc.left, y: rc.top };
-            let mut pt_br = POINT { x: rc.right, y: rc.bottom };
-            ScreenToClient(parent, &mut pt_tl);
-            ScreenToClient(parent, &mut pt_br);
-
             // 1px border with 4px rounded corners matching the ComboBox
-            RoundRect(hdc, pt_tl.x - 1, pt_tl.y - 1, pt_br.x + 1, pt_br.y + 1, 4, 4);
+            RoundRect(hdc, x - 1, y - 1, x + w + 1, y + h + 1, 4, 4);
         }
     }
 

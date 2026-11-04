@@ -4,8 +4,9 @@ pub mod clicker;
 pub mod hotkeys;
 pub mod settings;
 pub mod ui;
+pub mod updater;
 
-use std::ptr::null_mut;
+use std::ptr::{null, null_mut};
 use std::sync::Arc;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
@@ -18,6 +19,13 @@ use clicker::*;
 use hotkeys::*;
 use settings::*;
 use ui::*;
+use updater::{UpdateInfo, UpdateStatus};
+
+pub const WM_APP_UPDATE_AVAILABLE: u32 = WM_USER + 101;
+pub const WM_APP_UPDATE_NOT_FOUND: u32 = WM_USER + 102;
+pub const WM_APP_UPDATE_CHECK_FAILED: u32 = WM_USER + 103;
+pub const WM_APP_UPDATE_FAILED: u32 = WM_USER + 104;
+pub const IDM_CHECK_UPDATES: u32 = 2001;
 
 #[link(name = "user32")]
 extern "system" {
@@ -299,6 +307,73 @@ fn toggle_clicker(hwnd: HWND, ctx: &mut WindowContext) {
     }
 }
 
+fn trigger_update_check(hwnd: HWND, ctx: &mut WindowContext, is_manual: bool) {
+    if matches!(ctx.state.update_status, UpdateStatus::Checking | UpdateStatus::Downloading) {
+        return;
+    }
+    ctx.state.update_status = UpdateStatus::Checking;
+    let hwnd_num = hwnd as usize;
+    let manual_flag = if is_manual { 1 } else { 0 };
+    std::thread::spawn(move || {
+        match updater::check_for_updates() {
+            Ok(Some(info)) => {
+                let ptr = Box::into_raw(Box::new(info));
+                unsafe {
+                    if PostMessageW(hwnd_num as HWND, WM_APP_UPDATE_AVAILABLE, manual_flag, ptr as isize) == 0 {
+                        drop(Box::from_raw(ptr));
+                    }
+                }
+            }
+            Ok(None) => {
+                unsafe {
+                    PostMessageW(hwnd_num as HWND, WM_APP_UPDATE_NOT_FOUND, manual_flag, 0);
+                }
+            }
+            Err(e) => {
+                let ptr = Box::into_raw(Box::new(e));
+                unsafe {
+                    if PostMessageW(hwnd_num as HWND, WM_APP_UPDATE_CHECK_FAILED, manual_flag, ptr as isize) == 0 {
+                        drop(Box::from_raw(ptr));
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn start_download_and_install(hwnd: HWND, ctx: &mut WindowContext, download_url: String) {
+    save_current_settings(ctx);
+    ctx.state.update_status = UpdateStatus::Downloading;
+    let hwnd_num = hwnd as usize;
+    std::thread::spawn(move || {
+        match updater::download_update(&download_url) {
+            Ok(temp_path) => {
+                match updater::apply_update(&temp_path) {
+                    Ok(()) => unsafe {
+                        PostMessageW(hwnd_num as HWND, WM_CLOSE, 0, 0);
+                    },
+                    Err(e) => {
+                        let ptr = Box::into_raw(Box::new(e));
+                        unsafe {
+                            if PostMessageW(hwnd_num as HWND, WM_APP_UPDATE_FAILED, 0, ptr as isize) == 0 {
+                                drop(Box::from_raw(ptr));
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                let ptr = Box::into_raw(Box::new(e));
+                unsafe {
+                    if PostMessageW(hwnd_num as HWND, WM_APP_UPDATE_FAILED, 0, ptr as isize) == 0 {
+                        drop(Box::from_raw(ptr));
+                    }
+                }
+            }
+        }
+    });
+}
+
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -314,7 +389,13 @@ unsafe extern "system" fn wnd_proc(
             let controls = create_controls(hwnd, hinstance, font_reg, font_bold);
 
             // Load saved settings (persists user choices across sessions)
-            let settings = load_settings();
+            let settings_fallback;
+            let settings = if !cs.lpCreateParams.is_null() {
+                &*(cs.lpCreateParams as *const AppSettings)
+            } else {
+                settings_fallback = load_settings();
+                &settings_fallback
+            };
 
             // 1. Timing mode and inputs
             if settings.timing_mode == 0 {
@@ -424,11 +505,6 @@ unsafe extern "system" fn wnd_proc(
         }
 
         WM_CLOSE => {
-            let ctx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowContext;
-            if !ctx_ptr.is_null() {
-                let ctx = &*ctx_ptr;
-                save_current_settings(ctx);
-            }
             DestroyWindow(hwnd);
             0
         }
@@ -882,12 +958,121 @@ unsafe extern "system" fn wnd_proc(
             0
         }
 
+        WM_SYSCOMMAND => {
+            let cmd = (wparam & 0xFFF0) as u32;
+            if cmd == IDM_CHECK_UPDATES {
+                let ctx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowContext;
+                if !ctx_ptr.is_null() {
+                    let ctx = &mut *ctx_ptr;
+                    trigger_update_check(hwnd, ctx, true);
+                }
+                0
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+        }
+
+        WM_APP_UPDATE_AVAILABLE => {
+            let _is_manual = wparam == 1;
+            let update = Box::from_raw(lparam as *mut UpdateInfo);
+            let tag = update.tag.clone();
+            let download_url = update.download_url.clone();
+            let ctx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowContext;
+            if !ctx_ptr.is_null() {
+                let ctx = &mut *ctx_ptr;
+                ctx.state.update_status = UpdateStatus::Available(update);
+            }
+
+            let msg = format!(
+                "A new version of Clickr is available!\n\n\
+                 Current version: v{}\n\
+                 Latest version: {}\n\n\
+                 Would you like to download and install the update now?",
+                updater::CURRENT_VERSION,
+                tag
+            );
+            let res = MessageBoxW(
+                hwnd,
+                to_wide_null(&msg).as_ptr(),
+                to_wide_null("Clickr Update Available").as_ptr(),
+                MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON1,
+            );
+            if res == IDYES {
+                if !ctx_ptr.is_null() {
+                    let ctx = &mut *ctx_ptr;
+                    start_download_and_install(hwnd, ctx, download_url);
+                }
+            }
+            0
+        }
+
+        WM_APP_UPDATE_NOT_FOUND => {
+            let is_manual = wparam == 1;
+            let ctx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowContext;
+            if !ctx_ptr.is_null() {
+                let ctx = &mut *ctx_ptr;
+                ctx.state.update_status = UpdateStatus::UpToDate;
+            }
+            if is_manual {
+                let msg = format!(
+                    "You are already using the latest version of Clickr (v{}).",
+                    updater::CURRENT_VERSION
+                );
+                MessageBoxW(
+                    hwnd,
+                    to_wide_null(&msg).as_ptr(),
+                    to_wide_null("Up to Date").as_ptr(),
+                    MB_OK | MB_ICONINFORMATION,
+                );
+            }
+            0
+        }
+
+        WM_APP_UPDATE_CHECK_FAILED => {
+            let is_manual = wparam == 1;
+            let err_msg = Box::from_raw(lparam as *mut String);
+            let ctx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowContext;
+            if !ctx_ptr.is_null() {
+                let ctx = &mut *ctx_ptr;
+                ctx.state.update_status = UpdateStatus::Failed((*err_msg).clone());
+            }
+            if is_manual {
+                let msg = format!("Failed to check for updates:\n\n{}", err_msg);
+                MessageBoxW(
+                    hwnd,
+                    to_wide_null(&msg).as_ptr(),
+                    to_wide_null("Update Check Failed").as_ptr(),
+                    MB_OK | MB_ICONWARNING,
+                );
+            }
+            0
+        }
+
+        WM_APP_UPDATE_FAILED => {
+            let err_msg = Box::from_raw(lparam as *mut String);
+            let ctx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowContext;
+            if !ctx_ptr.is_null() {
+                let ctx = &mut *ctx_ptr;
+                ctx.state.update_status = UpdateStatus::Failed((*err_msg).clone());
+            }
+            MessageBoxW(
+                hwnd,
+                to_wide_null(&format!("Failed to install update:\n\n{}", err_msg)).as_ptr(),
+                to_wide_null("Update Error").as_ptr(),
+                MB_OK | MB_ICONERROR,
+            );
+            0
+        }
+
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
 
 fn main() {
     unsafe {
+        // Clean up previous backup binary if an update was just installed
+        updater::cleanup_old_version();
+
         // Initialize modern Common Controls v6
         let mut icc = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
@@ -986,7 +1171,7 @@ fn main() {
             null_mut(),
             null_mut(),
             hinstance,
-            null_mut(),
+            &settings as *const AppSettings as *const std::ffi::c_void,
         );
 
         // Set modern application icon explicitly on window instance
@@ -995,6 +1180,18 @@ fn main() {
         }
         if icon_small != null_mut() {
             SendMessageW(hwnd, WM_SETICON, ICON_SMALL as WPARAM, icon_small as LPARAM);
+        }
+
+        // Add Check for Updates to window system menu (Alt+Space or title bar right-click)
+        let sys_menu = GetSystemMenu(hwnd, 0);
+        if sys_menu != null_mut() {
+            AppendMenuW(sys_menu, MF_SEPARATOR, 0, null());
+            AppendMenuW(
+                sys_menu,
+                MF_STRING,
+                IDM_CHECK_UPDATES as usize,
+                to_wide_null("Check for Updates...").as_ptr(),
+            );
         }
 
         // Enable Windows 10/11 native immersive dark mode title bar
@@ -1014,6 +1211,29 @@ fn main() {
 
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
+
+        // Background update check on startup (non-blocking)
+        let hwnd_num = hwnd as usize;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            match updater::check_for_updates() {
+                Ok(Some(info)) => {
+                    let ptr = Box::into_raw(Box::new(info));
+                    if PostMessageW(hwnd_num as HWND, WM_APP_UPDATE_AVAILABLE, 0, ptr as isize) == 0 {
+                        drop(Box::from_raw(ptr));
+                    }
+                }
+                Ok(None) => {
+                    PostMessageW(hwnd_num as HWND, WM_APP_UPDATE_NOT_FOUND, 0, 0);
+                }
+                Err(e) => {
+                    let ptr = Box::into_raw(Box::new(e));
+                    if PostMessageW(hwnd_num as HWND, WM_APP_UPDATE_CHECK_FAILED, 0, ptr as isize) == 0 {
+                        drop(Box::from_raw(ptr));
+                    }
+                }
+            }
+        });
 
         let mut initial_rc: RECT = std::mem::zeroed();
         GetWindowRect(hwnd, &mut initial_rc);

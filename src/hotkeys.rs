@@ -270,7 +270,7 @@ pub fn stop_rebind() {
 /// Register the global Start/Stop hotkey.
 pub fn register_start_stop_hotkey(hwnd: HWND, vk: u32) -> bool {
     unsafe {
-        RegisterHotKey(hwnd, HOTKEY_ID_START_STOP, 0, vk) != 0
+        RegisterHotKey(hwnd, HOTKEY_ID_START_STOP, MOD_NOREPEAT, vk) != 0
     }
 }
 
@@ -289,30 +289,21 @@ unsafe extern "system" fn mouse_monitor_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     if code >= 0 && MOUSE_MONITOR_ACTIVE.load(Ordering::Acquire) {
-        let mouse = &*(lparam as *const MSLLHOOKSTRUCT);
-        // LLMHF_INJECTED is bit 0 of flags. If 0, event originated from real physical mouse hardware!
-        if (mouse.flags & 1) == 0 {
-            let msg = wparam as u32;
-            let btn = MOUSE_MONITOR_BTN.load(Ordering::Acquire);
-            let (down_msg, up_msg) = match btn {
-                1 => (WM_RBUTTONDOWN, WM_RBUTTONUP),
-                2 => (WM_MBUTTONDOWN, WM_MBUTTONUP),
-                _ => (WM_LBUTTONDOWN, WM_LBUTTONUP),
-            };
+        let msg = wparam as u32;
+        let btn = MOUSE_MONITOR_BTN.load(Ordering::Acquire);
+        let (down_msg, up_msg) = match btn {
+            1 => (WM_RBUTTONDOWN, WM_RBUTTONUP),
+            2 => (WM_MBUTTONDOWN, WM_MBUTTONUP),
+            _ => (WM_LBUTTONDOWN, WM_LBUTTONUP),
+        };
 
-            if msg == down_msg {
-                crate::clicker::set_physical_mouse_down(true);
-                if let Ok(sig_guard) = MOUSE_MONITOR_SIGNAL.lock() {
+        if msg == down_msg || msg == up_msg {
+            let mouse = &*(lparam as *const MSLLHOOKSTRUCT);
+            // LLMHF_INJECTED is bit 0 of flags. If 0, event originated from real physical mouse hardware!
+            if (mouse.flags & 1) == 0 {
+                crate::clicker::set_physical_mouse_down(msg == down_msg);
+                if let Ok(sig_guard) = MOUSE_MONITOR_SIGNAL.try_lock() {
                     if let Some(ref signal) = *sig_guard {
-                        let _guard = signal.mutex.lock();
-                        signal.condvar.notify_all();
-                    }
-                }
-            } else if msg == up_msg {
-                crate::clicker::set_physical_mouse_down(false);
-                if let Ok(sig_guard) = MOUSE_MONITOR_SIGNAL.lock() {
-                    if let Some(ref signal) = *sig_guard {
-                        let _guard = signal.mutex.lock();
                         signal.condvar.notify_all();
                     }
                 }

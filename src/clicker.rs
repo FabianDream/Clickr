@@ -726,11 +726,8 @@ pub fn run_worker_loop_internal<F: FnMut(ClickTarget)>(
             // Phase 1: Coarse responsive sleep while remaining > 1.5ms (0% CPU)
             if remaining > Duration::from_micros(1500) {
                 let sleep_duration = (remaining - Duration::from_micros(1000)).max(Duration::from_millis(1));
-                // Clamp sleep step to at most 15ms if in Hold/HoldMouse trigger mode or Specific location mode
+                // Clamp sleep step to at most 15ms if in Hold/HoldMouse trigger mode
                 let mut sleep_step = sleep_duration;
-                if let MouseLocation::Specific(_, _) = config.location {
-                    sleep_step = sleep_step.min(Duration::from_millis(20));
-                }
                 if config.trigger_mode == TriggerMode::Hold || config.trigger_mode == TriggerMode::HoldMouse {
                     sleep_step = sleep_step.min(Duration::from_millis(15));
                 }
@@ -742,11 +739,6 @@ pub fn run_worker_loop_internal<F: FnMut(ClickTarget)>(
                 let (new_lock, _) = signal.condvar.wait_timeout(lock, sleep_step).unwrap();
                 if !*new_lock || !signal.running.load(Ordering::Relaxed) {
                     return;
-                }
-                if let MouseLocation::Specific(x, y) = config.location {
-                    unsafe {
-                        windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y);
-                    }
                 }
                 continue;
             }

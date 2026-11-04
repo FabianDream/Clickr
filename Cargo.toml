@@ -1,6 +1,6 @@
 [package]
 name = "clickr"
-version = "0.1.0"
+version = "1.1.5"
 edition = "2021"
 authors = ["Fabian"]
 license = "MIT"
@@ -16,6 +16,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Controls",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
+    "Win32_Networking_WinHttp",
+    "Win32_Networking_WinInet",
+    "Win32_UI_Shell",
 ] }
 
 [profile.release]
