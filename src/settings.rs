@@ -1,6 +1,9 @@
+use std::fmt::Write;
 use std::fs;
 use std::path::PathBuf;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_F6, VK_SPACE};
+
+use crate::clicker::RateUnit;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppSettings {
@@ -194,31 +197,37 @@ pub fn load_settings() -> AppSettings {
     }
 
     // Safety constraint: Enforce safe CPS limits on loaded rate & interval (max 100 CPS / min 10 ms)
-    let max_rate = match settings.rate_unit {
-        1 => 6000.0,   // 100 CPS * 60 (CPM)
-        2 => 360000.0, // 100 CPS * 3600 (CPH)
-        _ => 100.0,    // 100 CPS
-    };
+    clamp_settings_limits(&mut settings);
+
+    settings
+}
+
+/// Enforce safe CPS/interval limits (max 100 CPS / min 10 ms) on `AppSettings`.
+pub fn clamp_settings_limits(settings: &mut AppSettings) {
+    let max_rate = RateUnit::from_index(settings.rate_unit).max_safe_rate();
     if let Ok(val) = settings.rate.parse::<f64>() {
         if val > max_rate {
             settings.rate = format!("{}", max_rate as u64);
         }
     }
 
-    if settings.hr == "0" && settings.min == "0" && settings.sec == "0" {
-        if let Ok(ms_val) = settings.ms.parse::<u64>() {
+    let hr = settings.hr.trim().parse::<u64>().unwrap_or(0);
+    let min = settings.min.trim().parse::<u64>().unwrap_or(0);
+    let sec = settings.sec.trim().parse::<u64>().unwrap_or(0);
+    if hr == 0 && min == 0 && sec == 0 {
+        if let Ok(ms_val) = settings.ms.trim().parse::<u64>() {
             if ms_val < 10 {
                 settings.ms = "10".to_string();
             }
         }
     }
-
-    settings
 }
 
 pub fn save_settings(settings: &AppSettings) {
     let path = get_config_path();
-    let content = format!(
+    let mut content = String::with_capacity(256);
+    let _ = write!(
+        content,
         "hotkey={}\ntarget_key={}\ntrigger_mode={}\ntiming_mode={}\nhr={}\nmin={}\nsec={}\nms={}\nrate={}\nrate_unit={}\ninput_mode={}\nmouse_btn={}\nclick_type={}\nlocation_mode={}\ntarget_x={}\ntarget_y={}\nclick_amount={}\npos_x={}\npos_y={}\n",
         settings.hotkey,
         settings.target_key,

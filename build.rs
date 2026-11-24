@@ -219,10 +219,15 @@ fn generate_app_ico(path: &str) {
         ico.extend_from_slice(&dib);
     }
 
-    std::fs::write(path, ico).unwrap();
+    if std::fs::read(path).ok().as_deref() != Some(ico.as_slice()) {
+        std::fs::write(path, ico).unwrap();
+    }
 }
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=app.manifest");
+
     if std::env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
         let out_dir = std::env::var("OUT_DIR").unwrap();
@@ -240,7 +245,9 @@ fn main() {
             "1 ICON \"{}\"\n1 24 \"{}\"\n",
             ico_path, manifest_path
         );
-        std::fs::write(&rc_path, rc_content).unwrap();
+        if std::fs::read_to_string(&rc_path).ok().as_deref() != Some(rc_content.as_str()) {
+            std::fs::write(&rc_path, rc_content).unwrap();
+        }
 
         let status = std::process::Command::new("windres")
             .args(&[&rc_path, "-o", &obj_path])
@@ -248,7 +255,7 @@ fn main() {
             .expect("Failed to execute windres");
 
         if status.success() {
-            println!("cargo:rustc-link-arg={}", obj_path);
+            println!("cargo:rustc-link-arg-bin=clickr={}", obj_path);
         }
     }
 }

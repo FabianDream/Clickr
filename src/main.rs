@@ -33,6 +33,12 @@ extern "system" {
     fn MessageBeep(uType: u32) -> i32;
 }
 
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetProcessHeap() -> HANDLE;
+    fn HeapCompact(hHeap: HANDLE, dwFlags: u32) -> usize;
+}
+
 #[link(name = "dwmapi")]
 extern "system" {
     fn DwmSetWindowAttribute(
@@ -50,6 +56,7 @@ struct WindowContext {
     theme: ThemeBrushes,
     font_reg: HFONT,
     font_bold: HFONT,
+    last_saved_settings: Option<AppSettings>,
 }
 
 fn parse_u64_or_0(s: &str) -> u64 {
@@ -74,7 +81,11 @@ fn parse_f64_or_default(s: &str, def: f64) -> f64 {
     def
 }
 
-fn save_current_settings(ctx: &WindowContext) {
+fn non_empty_or(s: String, default: &str) -> String {
+    if s.is_empty() { default.to_string() } else { s }
+}
+
+fn save_current_settings(ctx: &mut WindowContext) {
     let timing_mode = ctx.state.timing_mode;
     let input_mode = ctx.state.input_mode;
     let location_mode = ctx.state.location_mode;
@@ -84,31 +95,13 @@ fn save_current_settings(ctx: &WindowContext) {
     let mouse_btn = combobox_get_cursel(ctx.controls.combo_mouse_btn);
     let click_type = get_click_type_from_combo(ctx.controls.combo_click_type, input_mode);
 
-    let hr = get_control_text(ctx.controls.edit_hr);
-    let min = get_control_text(ctx.controls.edit_min);
-    let sec = get_control_text(ctx.controls.edit_sec);
-    let mut ms = get_control_text(ctx.controls.edit_ms);
-    if hr == "0" && min == "0" && sec == "0" {
-        if let Ok(ms_val) = ms.parse::<u64>() {
-            if ms_val < 10 {
-                ms = "10".to_string();
-            }
-        }
-    }
+    let hr = non_empty_or(get_control_text(ctx.controls.edit_hr), "0");
+    let min = non_empty_or(get_control_text(ctx.controls.edit_min), "0");
+    let sec = non_empty_or(get_control_text(ctx.controls.edit_sec), "0");
+    let ms = non_empty_or(get_control_text(ctx.controls.edit_ms), "100");
+    let rate = non_empty_or(get_control_text(ctx.controls.edit_rate), "50");
+    let click_amount = non_empty_or(get_control_text(ctx.controls.edit_amount), "0");
 
-    let mut rate = get_control_text(ctx.controls.edit_rate);
-    let max_rate = match rate_unit {
-        1 => 6000.0,   // 100 CPS * 60 (CPM)
-        2 => 360000.0, // 100 CPS * 3600 (CPH)
-        _ => 100.0,    // 100 CPS
-    };
-    if let Ok(val) = rate.parse::<f64>() {
-        if val > max_rate {
-            rate = format!("{}", max_rate as u64);
-        }
-    }
-
-    let click_amount = get_control_text(ctx.controls.edit_amount);
     let target_x = parse_i32_or_0(&get_control_text(ctx.controls.edit_loc_x));
     let target_y = parse_i32_or_0(&get_control_text(ctx.controls.edit_loc_y));
 
@@ -122,16 +115,16 @@ fn save_current_settings(ctx: &WindowContext) {
         }
     };
 
-    let settings = AppSettings {
+    let mut settings = AppSettings {
         hotkey: ctx.state.hotkey,
         target_key: ctx.state.target_key,
         trigger_mode,
         timing_mode,
-        hr: if hr.is_empty() { "0".to_string() } else { hr },
-        min: if min.is_empty() { "0".to_string() } else { min },
-        sec: if sec.is_empty() { "0".to_string() } else { sec },
-        ms: if ms.is_empty() { "100".to_string() } else { ms },
-        rate: if rate.is_empty() { "50".to_string() } else { rate },
+        hr,
+        min,
+        sec,
+        ms,
+        rate,
         rate_unit,
         input_mode,
         mouse_btn,
@@ -139,12 +132,19 @@ fn save_current_settings(ctx: &WindowContext) {
         location_mode,
         target_x,
         target_y,
-        click_amount: if click_amount.is_empty() { "0".to_string() } else { click_amount },
+        click_amount,
         pos_x,
         pos_y,
     };
 
+    clamp_settings_limits(&mut settings);
+
+    if ctx.last_saved_settings.as_ref() == Some(&settings) {
+        return;
+    }
+
     save_settings(&settings);
+    ctx.last_saved_settings = Some(settings);
 }
 
 fn start_clicker(hwnd: HWND, ctx: &mut WindowContext) {
@@ -170,15 +170,11 @@ fn start_clicker(hwnd: HWND, ctx: &mut WindowContext) {
         set_control_text(ctx.controls.edit_ms, "10");
     }
 
-    let rate_unit = match combobox_get_cursel(ctx.controls.combo_rate_unit) {
-        1 => RateUnit::PerMinute,
-        2 => RateUnit::PerHour,
-        _ => RateUnit::PerSecond,
-    };
+    let rate_unit = RateUnit::from_index(combobox_get_cursel(ctx.controls.combo_rate_unit));
 
     let raw_rate = parse_f64_or_default(&get_control_text(ctx.controls.edit_rate), 50.0);
     // Enforce safe maximum rate (100 CPS) in Rate mode to prevent Windows slowdowns and crashes
-    let max_rate_for_unit = MAX_SAFE_CPS * rate_unit.unit_seconds();
+    let max_rate_for_unit = rate_unit.max_safe_rate();
     let rate = if raw_rate > max_rate_for_unit {
         set_control_text(ctx.controls.edit_rate, &format!("{}", max_rate_for_unit as u64));
         max_rate_for_unit
@@ -224,13 +220,6 @@ fn start_clicker(hwnd: HWND, ctx: &mut WindowContext) {
         MouseLocation::Current
     };
 
-    // Position mouse immediately if specific location is selected
-    if let MouseLocation::Specific(x, y) = location {
-        unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y);
-        }
-    }
-
     // Determine click amount (0 = infinite)
     let amount = parse_u64_or_0(&get_control_text(ctx.controls.edit_amount));
 
@@ -268,11 +257,24 @@ fn start_clicker(hwnd: HWND, ctx: &mut WindowContext) {
         InvalidateRect(hwnd, null_mut(), 1);
     }
 
-    // Spawn background worker thread
+    // Spawn background worker thread with compact 64KB stack
     let hwnd_raw = hwnd as isize;
-    std::thread::spawn(move || {
+    spawn_small_thread(move || {
         run_worker_loop(hwnd_raw, signal, config);
     });
+}
+
+fn spawn_small_thread<F>(f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    if std::thread::Builder::new()
+        .stack_size(64 * 1024)
+        .spawn(f)
+        .is_err()
+    {
+        // Fallback unreachable unless OS rejects explicit stack size
+    }
 }
 
 fn stop_clicker(hwnd: HWND, ctx: &mut WindowContext) {
@@ -298,6 +300,7 @@ fn stop_clicker(hwnd: HWND, ctx: &mut WindowContext) {
     unsafe {
         InvalidateRect(hwnd, null_mut(), 1);
     }
+    trim_working_set();
 }
 
 fn toggle_clicker(hwnd: HWND, ctx: &mut WindowContext) {
@@ -308,42 +311,45 @@ fn toggle_clicker(hwnd: HWND, ctx: &mut WindowContext) {
     }
 }
 
-/// Flush unused pages from the process working set back to the OS.
+/// Compact the Win32 process heap and flush unused pages from the working set back to the OS.
 pub fn trim_working_set() {
     unsafe {
+        let heap = GetProcessHeap();
+        if !heap.is_null() {
+            HeapCompact(heap, 0);
+        }
         SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
     }
 }
 
-fn trigger_update_check(hwnd: HWND, ctx: &mut WindowContext, is_manual: bool) {
-    if matches!(ctx.state.update_status, UpdateStatus::Checking | UpdateStatus::Downloading) {
-        return;
+unsafe fn post_boxed_msg<T>(hwnd: HWND, msg: u32, wparam: usize, payload: T) {
+    let ptr = Box::into_raw(Box::new(payload));
+    if PostMessageW(hwnd, msg, wparam, ptr as isize) == 0 {
+        drop(Box::from_raw(ptr));
     }
-    ctx.state.update_status = UpdateStatus::Checking;
+}
+
+unsafe fn show_message_box(hwnd: HWND, text: &str, title: &str, flags: u32) -> i32 {
+    with_wide_null(text, |text_ptr| {
+        with_wide_null(title, |title_ptr| MessageBoxW(hwnd, text_ptr, title_ptr, flags))
+    })
+}
+
+fn spawn_update_check(hwnd: HWND, is_manual: bool, delay_ms: u64) {
     let hwnd_num = hwnd as usize;
-    let manual_flag = if is_manual { 1 } else { 0 };
-    std::thread::spawn(move || {
-        match updater::check_for_updates() {
-            Ok(Some(info)) => {
-                let ptr = Box::into_raw(Box::new(info));
-                unsafe {
-                    if PostMessageW(hwnd_num as HWND, WM_APP_UPDATE_AVAILABLE, manual_flag, ptr as isize) == 0 {
-                        drop(Box::from_raw(ptr));
-                    }
+    let manual_flag = usize::from(is_manual);
+    spawn_small_thread(move || {
+        if delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+        unsafe {
+            let hwnd = hwnd_num as HWND;
+            match updater::check_for_updates() {
+                Ok(Some(info)) => post_boxed_msg(hwnd, WM_APP_UPDATE_AVAILABLE, manual_flag, info),
+                Ok(None) => {
+                    PostMessageW(hwnd, WM_APP_UPDATE_NOT_FOUND, manual_flag, 0);
                 }
-            }
-            Ok(None) => {
-                unsafe {
-                    PostMessageW(hwnd_num as HWND, WM_APP_UPDATE_NOT_FOUND, manual_flag, 0);
-                }
-            }
-            Err(e) => {
-                let ptr = Box::into_raw(Box::new(e));
-                unsafe {
-                    if PostMessageW(hwnd_num as HWND, WM_APP_UPDATE_CHECK_FAILED, manual_flag, ptr as isize) == 0 {
-                        drop(Box::from_raw(ptr));
-                    }
-                }
+                Err(e) => post_boxed_msg(hwnd, WM_APP_UPDATE_CHECK_FAILED, manual_flag, e),
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -351,37 +357,126 @@ fn trigger_update_check(hwnd: HWND, ctx: &mut WindowContext, is_manual: bool) {
     });
 }
 
+fn trigger_update_check(hwnd: HWND, ctx: &mut WindowContext, is_manual: bool) {
+    if matches!(ctx.state.update_status, UpdateStatus::Checking | UpdateStatus::Downloading) {
+        return;
+    }
+    ctx.state.update_status = UpdateStatus::Checking;
+    spawn_update_check(hwnd, is_manual, 0);
+}
+
 fn start_download_and_install(hwnd: HWND, ctx: &mut WindowContext, download_url: String) {
     save_current_settings(ctx);
     ctx.state.update_status = UpdateStatus::Downloading;
     let hwnd_num = hwnd as usize;
-    std::thread::spawn(move || {
-        match updater::download_update(&download_url) {
-            Ok(temp_path) => {
-                match updater::apply_update(&temp_path) {
-                    Ok(()) => unsafe {
-                        PostMessageW(hwnd_num as HWND, WM_CLOSE, 0, 0);
-                    },
-                    Err(e) => {
-                        let ptr = Box::into_raw(Box::new(e));
-                        unsafe {
-                            if PostMessageW(hwnd_num as HWND, WM_APP_UPDATE_FAILED, 0, ptr as isize) == 0 {
-                                drop(Box::from_raw(ptr));
-                            }
-                        }
-                    }
+    spawn_small_thread(move || {
+        let hwnd = hwnd_num as HWND;
+        let result = updater::download_update(&download_url)
+            .and_then(|temp_path| updater::apply_update(&temp_path));
+        unsafe {
+            match result {
+                Ok(()) => {
+                    PostMessageW(hwnd, WM_CLOSE, 0, 0);
                 }
-            }
-            Err(e) => {
-                let ptr = Box::into_raw(Box::new(e));
-                unsafe {
-                    if PostMessageW(hwnd_num as HWND, WM_APP_UPDATE_FAILED, 0, ptr as isize) == 0 {
-                        drop(Box::from_raw(ptr));
-                    }
-                }
+                Err(e) => post_boxed_msg(hwnd, WM_APP_UPDATE_FAILED, 0, e),
             }
         }
     });
+}
+
+fn cancel_active_rebind(ctx: &mut WindowContext) {
+    if ctx.state.rebind_target == RebindTarget::None {
+        return;
+    }
+    stop_rebind();
+    match ctx.state.rebind_target {
+        RebindTarget::Hotkey => set_control_text(ctx.controls.btn_hotkeys, "Set Hotkey"),
+        RebindTarget::TargetKey => {
+            let name = vk_to_string(ctx.state.target_key as u32);
+            set_control_text(ctx.controls.btn_key_target, &format!("Key: {}", name));
+        }
+        RebindTarget::PickLocation => set_control_text(ctx.controls.btn_pick_pos, "Pick"),
+        RebindTarget::None => {}
+    }
+    ctx.state.rebind_target = RebindTarget::None;
+}
+
+fn toggle_rebind_mode(hwnd: HWND, ctx: &mut WindowContext, target: RebindTarget) {
+    if ctx.state.rebind_target == target {
+        cancel_active_rebind(ctx);
+        return;
+    }
+    cancel_active_rebind(ctx);
+    ctx.state.rebind_target = target;
+    match target {
+        RebindTarget::Hotkey => {
+            set_control_text(ctx.controls.btn_hotkeys, "Press key...");
+            start_rebind(hwnd, RebindTarget::Hotkey);
+        }
+        RebindTarget::TargetKey => {
+            set_control_text(ctx.controls.btn_key_target, "Press key...");
+            start_rebind(hwnd, RebindTarget::TargetKey);
+        }
+        RebindTarget::PickLocation => {
+            set_control_text(ctx.controls.btn_pick_pos, "Click...");
+            start_pick_location(hwnd);
+        }
+        RebindTarget::None => {}
+    }
+}
+
+fn set_timing_mode(hwnd: HWND, ctx: &mut WindowContext, mode: u32) {
+    if ctx.state.is_running || ctx.state.timing_mode == mode {
+        return;
+    }
+    ctx.state.timing_mode = mode;
+    button_set_checked(ctx.controls.radio_interval, mode == 0);
+    button_set_checked(ctx.controls.radio_rate, mode == 1);
+    update_timing_visibility(&ctx.controls, mode);
+    save_current_settings(ctx);
+    unsafe {
+        InvalidateRect(hwnd, null_mut(), 1);
+    }
+}
+
+fn set_input_mode(hwnd: HWND, ctx: &mut WindowContext, mode: u32) {
+    if ctx.state.is_running || ctx.state.input_mode == mode {
+        return;
+    }
+    let current_type = get_click_type_from_combo(ctx.controls.combo_click_type, ctx.state.input_mode);
+    let current_trigger = combobox_get_cursel(ctx.controls.combo_trigger_mode);
+    ctx.state.input_mode = mode;
+    button_set_checked(ctx.controls.radio_mouse, mode == 0);
+    button_set_checked(ctx.controls.radio_keyboard, mode == 1);
+    update_input_visibility(&ctx.controls, mode);
+    update_click_type_options(ctx.controls.combo_click_type, mode, current_type);
+    update_trigger_mode_options(ctx.controls.combo_trigger_mode, mode, current_trigger);
+    ctx.state.trigger_mode = combobox_get_cursel(ctx.controls.combo_trigger_mode) as u32;
+    update_location_state(&ctx.controls, mode, ctx.state.location_mode);
+    let label = if mode == 0 {
+        "Click Amount (0 = forever):"
+    } else {
+        "Press Amount (0 = forever):"
+    };
+    set_control_text(ctx.controls.lbl_amount, label);
+    save_current_settings(ctx);
+    unsafe {
+        InvalidateRect(hwnd, null_mut(), 1);
+    }
+}
+
+fn set_location_mode(hwnd: HWND, ctx: &mut WindowContext, mode: u32) {
+    if ctx.state.is_running || ctx.state.input_mode != 0 || ctx.state.location_mode == mode {
+        return;
+    }
+    ctx.state.location_mode = mode;
+    button_set_checked(ctx.controls.radio_loc_current, mode == 0);
+    button_set_checked(ctx.controls.radio_loc_specific, mode == 1);
+    update_location_state(&ctx.controls, ctx.state.input_mode, mode);
+    save_current_settings(ctx);
+    unsafe {
+        InvalidateRect(hwnd, null_mut(), 1);
+    }
 }
 
 unsafe extern "system" fn wnd_proc(
@@ -488,6 +583,7 @@ unsafe extern "system" fn wnd_proc(
                 theme: ThemeBrushes::new(),
                 font_reg,
                 font_bold,
+                last_saved_settings: Some(settings.clone()),
             });
 
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(ctx) as isize);
@@ -514,6 +610,13 @@ unsafe extern "system" fn wnd_proc(
             0
         }
 
+        WM_SIZE => {
+            if wparam == SIZE_MINIMIZED as usize {
+                trim_working_set();
+            }
+            0
+        }
+
         WM_CLOSE => {
             DestroyWindow(hwnd);
             0
@@ -525,8 +628,8 @@ unsafe extern "system" fn wnd_proc(
             let ctx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowContext;
             if !ctx_ptr.is_null() {
                 let ctx = &*ctx_ptr;
-                // Draw subtle, modern borders around edit inputs (replaces ugly white 3D borders)
-                draw_ui_borders(hdc, hwnd, &ctx.controls);
+                // Paint elevated dark cards and rounded edit input pills
+                draw_ui_chrome(hdc, &ctx.controls, &ctx.state);
             }
             EndPaint(hwnd, &mut ps);
             0
@@ -562,150 +665,55 @@ unsafe extern "system" fn wnd_proc(
 
                 ID_BTN_HOTKEYS => {
                     if notification == BN_CLICKED_U16 {
-                        if ctx.state.rebind_target == RebindTarget::Hotkey {
-                            // Cancel listening
-                            stop_rebind();
-                            ctx.state.rebind_target = RebindTarget::None;
-                            set_control_text(ctx.controls.btn_hotkeys, "Set Hotkey");
-                        } else {
-                            // Begin listening for new hotkey
-                            stop_rebind();
-                            if ctx.state.rebind_target == RebindTarget::PickLocation {
-                                set_control_text(ctx.controls.btn_pick_pos, "Pick");
-                            } else if ctx.state.rebind_target == RebindTarget::TargetKey {
-                                let name = vk_to_string(ctx.state.target_key as u32);
-                                set_control_text(ctx.controls.btn_key_target, &format!("Key: {}", name));
-                            }
-                            ctx.state.rebind_target = RebindTarget::Hotkey;
-                            set_control_text(ctx.controls.btn_hotkeys, "Press key...");
-                            start_rebind(hwnd, RebindTarget::Hotkey);
-                        }
+                        toggle_rebind_mode(hwnd, ctx, RebindTarget::Hotkey);
                     }
                 }
 
                 ID_BTN_KEY_TARGET => {
                     if notification == BN_CLICKED_U16 {
-                        if ctx.state.rebind_target == RebindTarget::TargetKey {
-                            // Cancel listening
-                            stop_rebind();
-                            ctx.state.rebind_target = RebindTarget::None;
-                            let name = vk_to_string(ctx.state.target_key as u32);
-                            set_control_text(ctx.controls.btn_key_target, &format!("Key: {}", name));
-                        } else {
-                            // Begin listening for target key
-                            stop_rebind();
-                            if ctx.state.rebind_target == RebindTarget::Hotkey {
-                                set_control_text(ctx.controls.btn_hotkeys, "Set Hotkey");
-                            } else if ctx.state.rebind_target == RebindTarget::PickLocation {
-                                set_control_text(ctx.controls.btn_pick_pos, "Pick");
-                            }
-                            ctx.state.rebind_target = RebindTarget::TargetKey;
-                            set_control_text(ctx.controls.btn_key_target, "Press key...");
-                            start_rebind(hwnd, RebindTarget::TargetKey);
-                        }
+                        toggle_rebind_mode(hwnd, ctx, RebindTarget::TargetKey);
                     }
                 }
 
                 ID_BTN_PICK_POS => {
                     if notification == BN_CLICKED_U16 {
-                        if ctx.state.rebind_target == RebindTarget::PickLocation {
-                            // Cancel listening
-                            stop_rebind();
-                            ctx.state.rebind_target = RebindTarget::None;
-                            set_control_text(ctx.controls.btn_pick_pos, "Pick");
-                        } else {
-                            // Begin picking location
-                            stop_rebind();
-                            if ctx.state.rebind_target == RebindTarget::Hotkey {
-                                set_control_text(ctx.controls.btn_hotkeys, "Set Hotkey");
-                            } else if ctx.state.rebind_target == RebindTarget::TargetKey {
-                                let name = vk_to_string(ctx.state.target_key as u32);
-                                set_control_text(ctx.controls.btn_key_target, &format!("Key: {}", name));
-                            }
-                            ctx.state.rebind_target = RebindTarget::PickLocation;
-                            set_control_text(ctx.controls.btn_pick_pos, "Click...");
-                            start_pick_location(hwnd);
-                        }
+                        toggle_rebind_mode(hwnd, ctx, RebindTarget::PickLocation);
                     }
                 }
 
                 ID_RADIO_INTERVAL | ID_LBL_RADIO_INTERVAL => {
-                    if notification == BN_CLICKED_U16 && !ctx.state.is_running {
-                        ctx.state.timing_mode = 0;
-                        button_set_checked(ctx.controls.radio_interval, true);
-                        button_set_checked(ctx.controls.radio_rate, false);
-                        update_timing_visibility(&ctx.controls, 0);
-                        save_current_settings(ctx);
-                        InvalidateRect(hwnd, null_mut(), 1);
+                    if notification == BN_CLICKED_U16 {
+                        set_timing_mode(hwnd, ctx, 0);
                     }
                 }
 
                 ID_RADIO_RATE | ID_LBL_RADIO_RATE => {
-                    if notification == BN_CLICKED_U16 && !ctx.state.is_running {
-                        ctx.state.timing_mode = 1;
-                        button_set_checked(ctx.controls.radio_interval, false);
-                        button_set_checked(ctx.controls.radio_rate, true);
-                        update_timing_visibility(&ctx.controls, 1);
-                        save_current_settings(ctx);
-                        InvalidateRect(hwnd, null_mut(), 1);
+                    if notification == BN_CLICKED_U16 {
+                        set_timing_mode(hwnd, ctx, 1);
                     }
                 }
 
                 ID_RADIO_MOUSE | ID_LBL_RADIO_MOUSE => {
-                    if notification == BN_CLICKED_U16 && !ctx.state.is_running {
-                        let current_type = get_click_type_from_combo(ctx.controls.combo_click_type, ctx.state.input_mode);
-                        let current_trigger = combobox_get_cursel(ctx.controls.combo_trigger_mode);
-                        ctx.state.input_mode = 0;
-                        button_set_checked(ctx.controls.radio_mouse, true);
-                        button_set_checked(ctx.controls.radio_keyboard, false);
-                        update_input_visibility(&ctx.controls, 0);
-                        update_click_type_options(ctx.controls.combo_click_type, 0, current_type);
-                        update_trigger_mode_options(ctx.controls.combo_trigger_mode, 0, current_trigger);
-                        ctx.state.trigger_mode = combobox_get_cursel(ctx.controls.combo_trigger_mode) as u32;
-                        update_location_state(&ctx.controls, 0, ctx.state.location_mode);
-                        set_control_text(ctx.controls.lbl_amount, "Click Amount (0 = forever):");
-                        save_current_settings(ctx);
-                        InvalidateRect(hwnd, null_mut(), 1);
+                    if notification == BN_CLICKED_U16 {
+                        set_input_mode(hwnd, ctx, 0);
                     }
                 }
 
                 ID_RADIO_KEYBOARD | ID_LBL_RADIO_KEYBOARD => {
-                    if notification == BN_CLICKED_U16 && !ctx.state.is_running {
-                        let current_type = get_click_type_from_combo(ctx.controls.combo_click_type, ctx.state.input_mode);
-                        let current_trigger = combobox_get_cursel(ctx.controls.combo_trigger_mode);
-                        ctx.state.input_mode = 1;
-                        button_set_checked(ctx.controls.radio_mouse, false);
-                        button_set_checked(ctx.controls.radio_keyboard, true);
-                        update_input_visibility(&ctx.controls, 1);
-                        update_click_type_options(ctx.controls.combo_click_type, 1, current_type);
-                        update_trigger_mode_options(ctx.controls.combo_trigger_mode, 1, current_trigger);
-                        ctx.state.trigger_mode = combobox_get_cursel(ctx.controls.combo_trigger_mode) as u32;
-                        update_location_state(&ctx.controls, 1, ctx.state.location_mode);
-                        set_control_text(ctx.controls.lbl_amount, "Press Amount (0 = forever):");
-                        save_current_settings(ctx);
-                        InvalidateRect(hwnd, null_mut(), 1);
+                    if notification == BN_CLICKED_U16 {
+                        set_input_mode(hwnd, ctx, 1);
                     }
                 }
 
                 ID_RADIO_LOC_CURRENT | ID_LBL_RADIO_LOC_CURRENT => {
-                    if notification == BN_CLICKED_U16 && !ctx.state.is_running && ctx.state.input_mode == 0 {
-                        ctx.state.location_mode = 0;
-                        button_set_checked(ctx.controls.radio_loc_current, true);
-                        button_set_checked(ctx.controls.radio_loc_specific, false);
-                        update_location_state(&ctx.controls, ctx.state.input_mode, 0);
-                        save_current_settings(ctx);
-                        InvalidateRect(hwnd, null_mut(), 1);
+                    if notification == BN_CLICKED_U16 {
+                        set_location_mode(hwnd, ctx, 0);
                     }
                 }
 
                 ID_RADIO_LOC_SPECIFIC | ID_LBL_RADIO_LOC_SPECIFIC => {
-                    if notification == BN_CLICKED_U16 && !ctx.state.is_running && ctx.state.input_mode == 0 {
-                        ctx.state.location_mode = 1;
-                        button_set_checked(ctx.controls.radio_loc_current, false);
-                        button_set_checked(ctx.controls.radio_loc_specific, true);
-                        update_location_state(&ctx.controls, ctx.state.input_mode, 1);
-                        save_current_settings(ctx);
-                        InvalidateRect(hwnd, null_mut(), 1);
+                    if notification == BN_CLICKED_U16 {
+                        set_location_mode(hwnd, ctx, 1);
                     }
                 }
 
@@ -854,14 +862,17 @@ unsafe extern "system" fn wnd_proc(
             let ctx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowContext;
             if !ctx_ptr.is_null() {
                 let ctx = &*ctx_ptr;
-                let is_edit = ctrl_hwnd == ctx.controls.edit_hr
-                    || ctrl_hwnd == ctx.controls.edit_min
-                    || ctrl_hwnd == ctx.controls.edit_sec
-                    || ctrl_hwnd == ctx.controls.edit_ms
-                    || ctrl_hwnd == ctx.controls.edit_rate
-                    || ctrl_hwnd == ctx.controls.edit_amount
-                    || ctrl_hwnd == ctx.controls.edit_loc_x
-                    || ctrl_hwnd == ctx.controls.edit_loc_y;
+                let is_edit = [
+                    ctx.controls.edit_hr,
+                    ctx.controls.edit_min,
+                    ctx.controls.edit_sec,
+                    ctx.controls.edit_ms,
+                    ctx.controls.edit_rate,
+                    ctx.controls.edit_amount,
+                    ctx.controls.edit_loc_x,
+                    ctx.controls.edit_loc_y,
+                ]
+                .contains(&ctrl_hwnd);
 
                 if is_edit {
                     SetBkMode(hdc, 2 /* OPAQUE */);
@@ -870,21 +881,26 @@ unsafe extern "system" fn wnd_proc(
                     return ctx.theme.disabled_edit_brush as LRESULT;
                 }
 
-                // Determine if this static label represents an inactive or running state.
-                // When autoclicker is running, all labels are dimmed with clean, crisp COLOR_TEXT_MUTED font (no 3D emboss).
-                // When stopped, location labels are dimmed in Keyboard mode, and X/Y labels are dimmed in Current location mode.
+                let is_secondary_unit = [
+                    ctx.controls.lbl_hr,
+                    ctx.controls.lbl_min,
+                    ctx.controls.lbl_sec,
+                    ctx.controls.lbl_ms,
+                    ctx.controls.lbl_loc_x,
+                    ctx.controls.lbl_loc_y,
+                ]
+                .contains(&ctrl_hwnd);
+
+                // Dim inactive or running labels with clean COLOR_TEXT_MUTED font (no 3D emboss)
                 let is_dimmed = ctx.state.is_running
-                    || (ctx.state.input_mode == 1 && (
-                        ctrl_hwnd == ctx.controls.lbl_location
-                        || ctrl_hwnd == ctx.controls.lbl_radio_loc_current
-                        || ctrl_hwnd == ctx.controls.lbl_radio_loc_specific
-                        || ctrl_hwnd == ctx.controls.lbl_loc_x
-                        || ctrl_hwnd == ctx.controls.lbl_loc_y
-                    ))
-                    || (ctx.state.location_mode == 0 && (
-                        ctrl_hwnd == ctx.controls.lbl_loc_x
-                        || ctrl_hwnd == ctx.controls.lbl_loc_y
-                    ));
+                    || is_secondary_unit
+                    || (ctx.state.input_mode == 1
+                        && [
+                            ctx.controls.lbl_location,
+                            ctx.controls.lbl_radio_loc_current,
+                            ctx.controls.lbl_radio_loc_specific,
+                        ]
+                        .contains(&ctrl_hwnd));
 
                 let text_color = if is_dimmed {
                     COLOR_TEXT_MUTED
@@ -893,9 +909,9 @@ unsafe extern "system" fn wnd_proc(
                 };
 
                 SetBkMode(hdc, 1 /* TRANSPARENT */);
-                SetBkColor(hdc, COLOR_BG);
+                SetBkColor(hdc, COLOR_CARD);
                 SetTextColor(hdc, text_color);
-                return ctx.theme.bg_brush as LRESULT;
+                return ctx.theme.card_brush as LRESULT;
             }
             GetSysColorBrush(15) as LRESULT
         }
@@ -931,18 +947,8 @@ unsafe extern "system" fn wnd_proc(
                 let ctx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowContext;
                 if !ctx_ptr.is_null() {
                     let ctx = &mut *ctx_ptr;
-                    if ctx.state.rebind_target == RebindTarget::Hotkey {
-                        stop_rebind();
-                        set_control_text(ctx.controls.btn_hotkeys, "Set Hotkey");
-                        ctx.state.rebind_target = RebindTarget::None;
-                    } else if ctx.state.rebind_target == RebindTarget::TargetKey {
-                        stop_rebind();
-                        let key_name = vk_to_string(ctx.state.target_key as u32);
-                        set_control_text(
-                            ctx.controls.btn_key_target,
-                            &format!("Key: {}", key_name),
-                        );
-                        ctx.state.rebind_target = RebindTarget::None;
+                    if matches!(ctx.state.rebind_target, RebindTarget::Hotkey | RebindTarget::TargetKey) {
+                        cancel_active_rebind(ctx);
                     }
                 }
             }
@@ -956,7 +962,7 @@ unsafe extern "system" fn wnd_proc(
                 if ctx.state.is_running {
                     stop_clicker(hwnd, &mut ctx);
                 }
-                save_current_settings(&ctx);
+                save_current_settings(&mut ctx);
                 stop_rebind();
                 unregister_start_stop_hotkey(hwnd);
                 ctx.theme.destroy();
@@ -1001,17 +1007,15 @@ unsafe extern "system" fn wnd_proc(
                 updater::CURRENT_VERSION,
                 tag
             );
-            let res = MessageBoxW(
+            let res = show_message_box(
                 hwnd,
-                to_wide_null(&msg).as_ptr(),
-                to_wide_null("Clickr Update Available").as_ptr(),
+                &msg,
+                "Clickr Update Available",
                 MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON1,
             );
-            if res == IDYES {
-                if !ctx_ptr.is_null() {
-                    let ctx = &mut *ctx_ptr;
-                    start_download_and_install(hwnd, ctx, download_url);
-                }
+            if res == IDYES && !ctx_ptr.is_null() {
+                let ctx = &mut *ctx_ptr;
+                start_download_and_install(hwnd, ctx, download_url);
             }
             0
         }
@@ -1028,12 +1032,7 @@ unsafe extern "system" fn wnd_proc(
                     "You are already using the latest version of Clickr (v{}).",
                     updater::CURRENT_VERSION
                 );
-                MessageBoxW(
-                    hwnd,
-                    to_wide_null(&msg).as_ptr(),
-                    to_wide_null("Up to Date").as_ptr(),
-                    MB_OK | MB_ICONINFORMATION,
-                );
+                show_message_box(hwnd, &msg, "Up to Date", MB_OK | MB_ICONINFORMATION);
             }
             0
         }
@@ -1048,12 +1047,7 @@ unsafe extern "system" fn wnd_proc(
             }
             if is_manual {
                 let msg = format!("Failed to check for updates:\n\n{}", err_msg);
-                MessageBoxW(
-                    hwnd,
-                    to_wide_null(&msg).as_ptr(),
-                    to_wide_null("Update Check Failed").as_ptr(),
-                    MB_OK | MB_ICONWARNING,
-                );
+                show_message_box(hwnd, &msg, "Update Check Failed", MB_OK | MB_ICONWARNING);
             }
             0
         }
@@ -1065,12 +1059,8 @@ unsafe extern "system" fn wnd_proc(
                 let ctx = &mut *ctx_ptr;
                 ctx.state.update_status = UpdateStatus::Failed((*err_msg).clone());
             }
-            MessageBoxW(
-                hwnd,
-                to_wide_null(&format!("Failed to install update:\n\n{}", err_msg)).as_ptr(),
-                to_wide_null("Update Error").as_ptr(),
-                MB_OK | MB_ICONERROR,
-            );
+            let msg = format!("Failed to install update:\n\n{}", err_msg);
+            show_message_box(hwnd, &msg, "Update Error", MB_OK | MB_ICONERROR);
             0
         }
 
@@ -1135,13 +1125,13 @@ fn main() {
 
         RegisterClassW(&wnd_class);
 
-        // Fixed-size, compact window with client area 500 x 220 px
-        let window_style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+        // Fixed-size, compact window with refined card layout
+        let window_style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
         let mut rect = RECT {
             left: 0,
             top: 0,
-            right: 500,
-            bottom: 220,
+            right: UI_CLIENT_WIDTH,
+            bottom: UI_CLIENT_HEIGHT,
         };
         AdjustWindowRectEx(&mut rect, window_style, 0, 0);
 
@@ -1169,20 +1159,22 @@ fn main() {
             }
         }
 
-        let hwnd = CreateWindowExW(
-            0,
-            class_name.as_ptr(),
-            to_wide_null("Clickr").as_ptr(),
-            window_style,
-            pos_x,
-            pos_y,
-            win_width,
-            win_height,
-            null_mut(),
-            null_mut(),
-            hinstance,
-            &settings as *const AppSettings as *const std::ffi::c_void,
-        );
+        let hwnd = with_wide_null("Clickr", |title_ptr| {
+            CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                title_ptr,
+                window_style,
+                pos_x,
+                pos_y,
+                win_width,
+                win_height,
+                null_mut(),
+                null_mut(),
+                hinstance,
+                &settings as *const AppSettings as *const std::ffi::c_void,
+            )
+        });
 
         // Set modern application icon explicitly on window instance
         if icon_big != null_mut() {
@@ -1196,12 +1188,9 @@ fn main() {
         let sys_menu = GetSystemMenu(hwnd, 0);
         if sys_menu != null_mut() {
             AppendMenuW(sys_menu, MF_SEPARATOR, 0, null());
-            AppendMenuW(
-                sys_menu,
-                MF_STRING,
-                IDM_CHECK_UPDATES as usize,
-                to_wide_null("Check for Updates...").as_ptr(),
-            );
+            with_wide_null("Check for Updates...", |label_ptr| {
+                AppendMenuW(sys_menu, MF_STRING, IDM_CHECK_UPDATES as usize, label_ptr);
+            });
         }
 
         // Enable Windows 10/11 native immersive dark mode title bar
@@ -1221,31 +1210,10 @@ fn main() {
 
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
+        trim_working_set();
 
         // Background update check on startup (non-blocking)
-        let hwnd_num = hwnd as usize;
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(800));
-            match updater::check_for_updates() {
-                Ok(Some(info)) => {
-                    let ptr = Box::into_raw(Box::new(info));
-                    if PostMessageW(hwnd_num as HWND, WM_APP_UPDATE_AVAILABLE, 0, ptr as isize) == 0 {
-                        drop(Box::from_raw(ptr));
-                    }
-                }
-                Ok(None) => {
-                    PostMessageW(hwnd_num as HWND, WM_APP_UPDATE_NOT_FOUND, 0, 0);
-                }
-                Err(e) => {
-                    let ptr = Box::into_raw(Box::new(e));
-                    if PostMessageW(hwnd_num as HWND, WM_APP_UPDATE_CHECK_FAILED, 0, ptr as isize) == 0 {
-                        drop(Box::from_raw(ptr));
-                    }
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            trim_working_set();
-        });
+        spawn_update_check(hwnd, false, 800);
 
         let mut initial_rc: RECT = std::mem::zeroed();
         GetWindowRect(hwnd, &mut initial_rc);

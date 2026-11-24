@@ -1,7 +1,9 @@
+use std::borrow::Cow;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::System::Threading::SetEvent;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -26,8 +28,25 @@ static TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
 
 static MOUSE_MONITOR_ACTIVE: AtomicBool = AtomicBool::new(false);
 static MOUSE_MONITOR_BTN: AtomicU32 = AtomicU32::new(0);
+static MOUSE_MONITOR_DOWN_MSG: AtomicU32 = AtomicU32::new(WM_LBUTTONDOWN);
+static MOUSE_MONITOR_UP_MSG: AtomicU32 = AtomicU32::new(WM_LBUTTONUP);
+static MOUSE_MONITOR_WAKE_EVENT: AtomicIsize = AtomicIsize::new(0);
 static MOUSE_MONITOR_HOOK: AtomicIsize = AtomicIsize::new(0);
 static MOUSE_MONITOR_SIGNAL: Mutex<Option<Arc<WorkerSignal>>> = Mutex::new(None);
+
+const F_KEYS: [&str; 24] = [
+    "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+    "F13", "F14", "F15", "F16", "F17", "F18", "F19", "F20", "F21", "F22", "F23", "F24",
+];
+const DIGITS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+const LETTERS: [&str; 26] = [
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
+    "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+];
+const NUMPAD_DIGITS: [&str; 10] = [
+    "Num 0", "Num 1", "Num 2", "Num 3", "Num 4",
+    "Num 5", "Num 6", "Num 7", "Num 8", "Num 9",
+];
 
 /// Check if a virtual key code is a modifier key pressed by itself.
 pub fn is_lone_modifier(vk: u32) -> bool {
@@ -47,46 +66,46 @@ pub fn is_lone_modifier(vk: u32) -> bool {
     )
 }
 
-/// Convert a virtual key code into a human-readable display string.
-pub fn vk_to_string(vk: u32) -> String {
+/// Convert a virtual key code into a human-readable display string without heap allocation for common keys.
+pub fn vk_to_string(vk: u32) -> Cow<'static, str> {
     let vk16 = vk as u16;
     match vk16 {
-        VK_F1..=VK_F24 => format!("F{}", vk16 - VK_F1 + 1),
-        0x30..=0x39 => format!("{}", (vk16 as u8) as char),
-        0x41..=0x5A => format!("{}", (vk16 as u8) as char),
-        VK_SPACE => "Space".to_string(),
-        VK_RETURN => "Enter".to_string(),
-        VK_TAB => "Tab".to_string(),
-        VK_ESCAPE => "Esc".to_string(),
-        VK_BACK => "Backspace".to_string(),
-        VK_DELETE => "Delete".to_string(),
-        VK_INSERT => "Insert".to_string(),
-        VK_HOME => "Home".to_string(),
-        VK_END => "End".to_string(),
-        VK_PRIOR => "PageUp".to_string(),
-        VK_NEXT => "PageDown".to_string(),
-        VK_UP => "Up".to_string(),
-        VK_DOWN => "Down".to_string(),
-        VK_LEFT => "Left".to_string(),
-        VK_RIGHT => "Right".to_string(),
-        VK_CAPITAL => "CapsLock".to_string(),
-        VK_NUMPAD0..=VK_NUMPAD9 => format!("Num {}", vk16 - VK_NUMPAD0),
-        VK_MULTIPLY => "Num *".to_string(),
-        VK_ADD => "Num +".to_string(),
-        VK_SUBTRACT => "Num -".to_string(),
-        VK_DECIMAL => "Num .".to_string(),
-        VK_DIVIDE => "Num /".to_string(),
-        VK_OEM_1 => ";".to_string(),
-        VK_OEM_PLUS => "+".to_string(),
-        VK_OEM_COMMA => ",".to_string(),
-        VK_OEM_MINUS => "-".to_string(),
-        VK_OEM_PERIOD => ".".to_string(),
-        VK_OEM_2 => "/".to_string(),
-        VK_OEM_3 => "`".to_string(),
-        VK_OEM_4 => "[".to_string(),
-        VK_OEM_5 => "\\".to_string(),
-        VK_OEM_6 => "]".to_string(),
-        VK_OEM_7 => "'".to_string(),
+        VK_F1..=VK_F24 => Cow::Borrowed(F_KEYS[(vk16 - VK_F1) as usize]),
+        0x30..=0x39 => Cow::Borrowed(DIGITS[(vk16 - 0x30) as usize]),
+        0x41..=0x5A => Cow::Borrowed(LETTERS[(vk16 - 0x41) as usize]),
+        VK_SPACE => Cow::Borrowed("Space"),
+        VK_RETURN => Cow::Borrowed("Enter"),
+        VK_TAB => Cow::Borrowed("Tab"),
+        VK_ESCAPE => Cow::Borrowed("Esc"),
+        VK_BACK => Cow::Borrowed("Backspace"),
+        VK_DELETE => Cow::Borrowed("Delete"),
+        VK_INSERT => Cow::Borrowed("Insert"),
+        VK_HOME => Cow::Borrowed("Home"),
+        VK_END => Cow::Borrowed("End"),
+        VK_PRIOR => Cow::Borrowed("PageUp"),
+        VK_NEXT => Cow::Borrowed("PageDown"),
+        VK_UP => Cow::Borrowed("Up"),
+        VK_DOWN => Cow::Borrowed("Down"),
+        VK_LEFT => Cow::Borrowed("Left"),
+        VK_RIGHT => Cow::Borrowed("Right"),
+        VK_CAPITAL => Cow::Borrowed("CapsLock"),
+        VK_NUMPAD0..=VK_NUMPAD9 => Cow::Borrowed(NUMPAD_DIGITS[(vk16 - VK_NUMPAD0) as usize]),
+        VK_MULTIPLY => Cow::Borrowed("Num *"),
+        VK_ADD => Cow::Borrowed("Num +"),
+        VK_SUBTRACT => Cow::Borrowed("Num -"),
+        VK_DECIMAL => Cow::Borrowed("Num ."),
+        VK_DIVIDE => Cow::Borrowed("Num /"),
+        VK_OEM_1 => Cow::Borrowed(";"),
+        VK_OEM_PLUS => Cow::Borrowed("+"),
+        VK_OEM_COMMA => Cow::Borrowed(","),
+        VK_OEM_MINUS => Cow::Borrowed("-"),
+        VK_OEM_PERIOD => Cow::Borrowed("."),
+        VK_OEM_2 => Cow::Borrowed("/"),
+        VK_OEM_3 => Cow::Borrowed("`"),
+        VK_OEM_4 => Cow::Borrowed("["),
+        VK_OEM_5 => Cow::Borrowed("\\"),
+        VK_OEM_6 => Cow::Borrowed("]"),
+        VK_OEM_7 => Cow::Borrowed("'"),
         _ => {
             unsafe {
                 let scan = MapVirtualKeyW(vk, 0); // MAPVK_VK_TO_VSC = 0
@@ -98,11 +117,11 @@ pub fn vk_to_string(vk: u32) -> String {
                         buf.len() as i32,
                     );
                     if len > 0 {
-                        return String::from_utf16_lossy(&buf[..len as usize]);
+                        return Cow::Owned(String::from_utf16_lossy(&buf[..len as usize]));
                     }
                 }
             }
-            format!("Key 0x{:02X}", vk)
+            Cow::Owned(format!("Key 0x{:02X}", vk))
         }
     }
 }
@@ -288,23 +307,20 @@ unsafe extern "system" fn mouse_monitor_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if code >= 0 && MOUSE_MONITOR_ACTIVE.load(Ordering::Acquire) {
+    if code >= 0 {
         let msg = wparam as u32;
-        let btn = MOUSE_MONITOR_BTN.load(Ordering::Acquire);
-        let (down_msg, up_msg) = match btn {
-            1 => (WM_RBUTTONDOWN, WM_RBUTTONUP),
-            2 => (WM_MBUTTONDOWN, WM_MBUTTONUP),
-            _ => (WM_LBUTTONDOWN, WM_LBUTTONUP),
-        };
+        if msg != WM_MOUSEMOVE && MOUSE_MONITOR_ACTIVE.load(Ordering::Acquire) {
+            let down_msg = MOUSE_MONITOR_DOWN_MSG.load(Ordering::Relaxed);
+            let up_msg = MOUSE_MONITOR_UP_MSG.load(Ordering::Relaxed);
 
-        if msg == down_msg || msg == up_msg {
-            let mouse = &*(lparam as *const MSLLHOOKSTRUCT);
-            // LLMHF_INJECTED is bit 0 of flags. If 0, event originated from real physical mouse hardware!
-            if (mouse.flags & 1) == 0 {
-                crate::clicker::set_physical_mouse_down(msg == down_msg);
-                if let Ok(sig_guard) = MOUSE_MONITOR_SIGNAL.try_lock() {
-                    if let Some(ref signal) = *sig_guard {
-                        signal.condvar.notify_all();
+            if msg == down_msg || msg == up_msg {
+                let mouse = &*(lparam as *const MSLLHOOKSTRUCT);
+                // LLMHF_INJECTED is bit 0 of flags. If 0, event originated from real physical mouse hardware!
+                if (mouse.flags & 1) == 0 {
+                    crate::clicker::set_physical_mouse_down(msg == down_msg);
+                    let wake = MOUSE_MONITOR_WAKE_EVENT.load(Ordering::Acquire) as HANDLE;
+                    if !wake.is_null() {
+                        SetEvent(wake);
                     }
                 }
             }
@@ -317,18 +333,23 @@ unsafe extern "system" fn mouse_monitor_proc(
 /// Begin monitoring physical mouse button down/up for HoldMouse trigger mode.
 pub fn start_mouse_hold_monitor(btn: u32, signal: Arc<WorkerSignal>) {
     stop_mouse_hold_monitor();
+
+    let (down_msg, up_msg, vkey) = match btn {
+        1 => (WM_RBUTTONDOWN, WM_RBUTTONUP, VK_RBUTTON),
+        2 => (WM_MBUTTONDOWN, WM_MBUTTONUP, VK_MBUTTON),
+        _ => (WM_LBUTTONDOWN, WM_LBUTTONUP, VK_LBUTTON),
+    };
+
     MOUSE_MONITOR_BTN.store(btn, Ordering::Release);
+    MOUSE_MONITOR_DOWN_MSG.store(down_msg, Ordering::Relaxed);
+    MOUSE_MONITOR_UP_MSG.store(up_msg, Ordering::Relaxed);
+    MOUSE_MONITOR_WAKE_EVENT.store(signal.wake_handle_raw(), Ordering::Release);
     if let Ok(mut sig) = MOUSE_MONITOR_SIGNAL.lock() {
         *sig = Some(signal);
     }
     MOUSE_MONITOR_ACTIVE.store(true, Ordering::Release);
 
     // Check initial physical state of the button
-    let vkey = match btn {
-        1 => VK_RBUTTON,
-        2 => VK_MBUTTON,
-        _ => VK_LBUTTON,
-    };
     let is_down = unsafe { (GetAsyncKeyState(vkey as i32) as u16 & 0x8000) != 0 };
     crate::clicker::set_physical_mouse_down(is_down);
 
@@ -346,17 +367,19 @@ pub fn start_mouse_hold_monitor(btn: u32, signal: Arc<WorkerSignal>) {
 /// Stop monitoring physical mouse button and remove low-level mouse hook.
 pub fn stop_mouse_hold_monitor() {
     MOUSE_MONITOR_ACTIVE.store(false, Ordering::Release);
+    MOUSE_MONITOR_WAKE_EVENT.store(0, Ordering::Release);
     crate::clicker::set_physical_mouse_down(false);
-    if let Ok(mut sig) = MOUSE_MONITOR_SIGNAL.lock() {
-        if let Some(signal) = sig.take() {
-            let _guard = signal.mutex.lock();
-            signal.condvar.notify_all();
-        }
-    }
+
+    // Unhook before dropping Arc<WorkerSignal> so no hook callback can touch a closed event handle
     let hook = MOUSE_MONITOR_HOOK.swap(0, Ordering::AcqRel) as HHOOK;
     if hook != null_mut() {
         unsafe {
             UnhookWindowsHookEx(hook);
+        }
+    }
+    if let Ok(mut sig) = MOUSE_MONITOR_SIGNAL.lock() {
+        if let Some(signal) = sig.take() {
+            signal.notify();
         }
     }
 }

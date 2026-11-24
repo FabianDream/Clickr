@@ -1,9 +1,34 @@
+use std::ffi::c_void;
+use std::ptr::null;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, POINT, WAIT_OBJECT_0};
+use windows_sys::Win32::System::Threading::{
+    SetEvent, SetWaitableTimer, WaitForMultipleObjects, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+    INFINITE, TIMER_ALL_ACCESS,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
-use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetAncestor, GetCursorPos, GetForegroundWindow, PostMessageW, SetCursorPos, WindowFromPoint,
+    GA_ROOT,
+};
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateEventW(
+        lpEventAttributes: *const c_void,
+        bManualReset: i32,
+        bInitialState: i32,
+        lpName: *const u16,
+    ) -> HANDLE;
+    fn CreateWaitableTimerExW(
+        lpTimerAttributes: *const c_void,
+        lpTimerName: *const u16,
+        dwFlags: u32,
+        dwDesiredAccess: u32,
+    ) -> HANDLE;
+}
 
 #[link(name = "winmm")]
 extern "system" {
@@ -53,12 +78,24 @@ pub enum RateUnit {
 }
 
 impl RateUnit {
+    pub fn from_index(index: usize) -> Self {
+        match index {
+            1 => RateUnit::PerMinute,
+            2 => RateUnit::PerHour,
+            _ => RateUnit::PerSecond,
+        }
+    }
+
     pub fn unit_seconds(&self) -> f64 {
         match self {
             RateUnit::PerSecond => 1.0,
             RateUnit::PerMinute => 60.0,
             RateUnit::PerHour => 3600.0,
         }
+    }
+
+    pub fn max_safe_rate(&self) -> f64 {
+        MAX_SAFE_CPS * self.unit_seconds()
     }
 }
 
@@ -127,26 +164,133 @@ pub struct ClickerConfig {
     pub amount: u64,
 }
 
+struct OwnedHandle(HANDLE);
+
+unsafe impl Send for OwnedHandle {}
+unsafe impl Sync for OwnedHandle {}
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+/// High-resolution Win32 waitable timer with automatic fallback on older Windows versions.
+pub struct WaitableTimer {
+    handle: OwnedHandle,
+    is_high_res: bool,
+}
+
+impl WaitableTimer {
+    pub fn new() -> Self {
+        let (handle, is_high_res) = unsafe {
+            let h = CreateWaitableTimerExW(
+                null(),
+                null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS,
+            );
+            if h.is_null() {
+                (CreateWaitableTimerExW(null(), null(), 0, TIMER_ALL_ACCESS), false)
+            } else {
+                (h, true)
+            }
+        };
+        Self {
+            handle: OwnedHandle(handle),
+            is_high_res,
+        }
+    }
+
+    fn arm(&self, duration: Duration) -> bool {
+        if self.handle.0.is_null() {
+            return false;
+        }
+        let ticks_100ns = (duration.as_nanos() / 100).max(1).min(i64::MAX as u128) as i64;
+        let due_time = -ticks_100ns;
+        unsafe { SetWaitableTimer(self.handle.0, &due_time, 0, None, null(), 0) != 0 }
+    }
+}
+
 pub struct WorkerSignal {
     pub running: AtomicBool,
-    pub mutex: Mutex<bool>,
-    pub condvar: Condvar,
+    stop_event: OwnedHandle,
+    wake_event: OwnedHandle,
 }
 
 impl WorkerSignal {
     pub fn new() -> Self {
+        let stop_event = unsafe { CreateEventW(null(), 1, 0, null()) };
+        let wake_event = unsafe { CreateEventW(null(), 0, 0, null()) };
         Self {
             running: AtomicBool::new(true),
-            mutex: Mutex::new(true),
-            condvar: Condvar::new(),
+            stop_event: OwnedHandle(stop_event),
+            wake_event: OwnedHandle(wake_event),
         }
     }
 
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
-        let mut lock = self.mutex.lock().unwrap();
-        *lock = false;
-        self.condvar.notify_all();
+        if !self.stop_event.0.is_null() {
+            unsafe {
+                SetEvent(self.stop_event.0);
+            }
+        }
+    }
+
+    /// Wake any thread waiting on this signal (e.g. physical mouse state change).
+    pub fn notify(&self) {
+        if !self.wake_event.0.is_null() {
+            unsafe {
+                SetEvent(self.wake_event.0);
+            }
+        }
+    }
+
+    /// Raw Win32 wake event handle for lock-free signaling from low-level hooks.
+    pub fn wake_handle_raw(&self) -> isize {
+        self.wake_event.0 as isize
+    }
+
+    /// Wait until either `stop()` is called, `notify()` is called, or `duration` elapses.
+    /// Returns `false` if the worker was stopped.
+    fn wait_for_timer_or_wake(&self, duration: Duration, timer: Option<&WaitableTimer>) -> bool {
+        if !self.running.load(Ordering::Acquire) {
+            return false;
+        }
+        if let Some(t) = timer {
+            if !self.stop_event.0.is_null() && !self.wake_event.0.is_null() && t.arm(duration) {
+                let handles = [self.stop_event.0, self.wake_event.0, t.handle.0];
+                let res = unsafe { WaitForMultipleObjects(3, handles.as_ptr(), 0, INFINITE) };
+                return res != WAIT_OBJECT_0 && self.running.load(Ordering::Acquire);
+            }
+        }
+        if !self.stop_event.0.is_null() && !self.wake_event.0.is_null() {
+            let handles = [self.stop_event.0, self.wake_event.0];
+            let ms = duration.as_millis().max(1).min(u32::MAX as u128) as u32;
+            let res = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, ms) };
+            return res != WAIT_OBJECT_0 && self.running.load(Ordering::Acquire);
+        }
+        std::thread::sleep(duration);
+        self.running.load(Ordering::Acquire)
+    }
+
+    /// Wait until `stop()` or `notify()` (or safety timeout) while paused in HoldMouse mode.
+    fn wait_while_paused(&self) -> bool {
+        if !self.running.load(Ordering::Acquire) {
+            return false;
+        }
+        if !self.stop_event.0.is_null() && !self.wake_event.0.is_null() {
+            let handles = [self.stop_event.0, self.wake_event.0];
+            let res = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, 50) };
+            return res != WAIT_OBJECT_0 && self.running.load(Ordering::Acquire);
+        }
+        std::thread::sleep(Duration::from_millis(15));
+        self.running.load(Ordering::Acquire)
     }
 }
 
@@ -237,70 +381,55 @@ pub fn create_keyboard_input(vk: u16, is_up: bool) -> INPUT {
     }
 }
 
+#[inline]
+fn make_mouse_input(flags: u32) -> INPUT {
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+#[inline]
+fn mouse_button_flags(btn: MouseButton) -> (u32, u32) {
+    match btn {
+        MouseButton::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+        MouseButton::Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+        MouseButton::Middle => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+    }
+}
+
+#[inline]
+fn send_inputs(inputs: &[INPUT]) {
+    unsafe {
+        SendInput(inputs.len() as u32, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
 /// Press a target mouse button or keyboard key down (used for Hold click type).
 pub fn press_target_down(target: ClickTarget) {
-    unsafe {
-        match target {
-            ClickTarget::Mouse(btn, _) => {
-                let down_flag = match btn {
-                    MouseButton::Left => MOUSEEVENTF_LEFTDOWN,
-                    MouseButton::Right => MOUSEEVENTF_RIGHTDOWN,
-                    MouseButton::Middle => MOUSEEVENTF_MIDDLEDOWN,
-                };
-                let input = INPUT {
-                    r#type: INPUT_MOUSE,
-                    Anonymous: INPUT_0 {
-                        mi: MOUSEINPUT {
-                            dx: 0,
-                            dy: 0,
-                            mouseData: 0,
-                            dwFlags: down_flag,
-                            time: 0,
-                            dwExtraInfo: 0,
-                        },
-                    },
-                };
-                SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
-            }
-            ClickTarget::Keyboard(vk, _) => {
-                let input = create_keyboard_input(vk, false);
-                SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
-            }
-        }
-    }
+    let input = match target {
+        ClickTarget::Mouse(btn, _) => make_mouse_input(mouse_button_flags(btn).0),
+        ClickTarget::Keyboard(vk, _) => create_keyboard_input(vk, false),
+    };
+    send_inputs(std::slice::from_ref(&input));
 }
 
 /// Release a target mouse button or keyboard key up (used for Hold click type).
 pub fn release_target(target: ClickTarget) {
-    unsafe {
-        match target {
-            ClickTarget::Mouse(btn, _) => {
-                let up_flag = match btn {
-                    MouseButton::Left => MOUSEEVENTF_LEFTUP,
-                    MouseButton::Right => MOUSEEVENTF_RIGHTUP,
-                    MouseButton::Middle => MOUSEEVENTF_MIDDLEUP,
-                };
-                let input = INPUT {
-                    r#type: INPUT_MOUSE,
-                    Anonymous: INPUT_0 {
-                        mi: MOUSEINPUT {
-                            dx: 0,
-                            dy: 0,
-                            mouseData: 0,
-                            dwFlags: up_flag,
-                            time: 0,
-                            dwExtraInfo: 0,
-                        },
-                    },
-                };
-                SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
-            }
-            ClickTarget::Keyboard(vk, _) => {
-                let input = create_keyboard_input(vk, true);
-                SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
-            }
-        }
-    }
+    let input = match target {
+        ClickTarget::Mouse(btn, _) => make_mouse_input(mouse_button_flags(btn).1),
+        ClickTarget::Keyboard(vk, _) => create_keyboard_input(vk, true),
+    };
+    send_inputs(std::slice::from_ref(&input));
 }
 
 /// Simulate a single/double click or hold state for mouse or keyboard with default hold time.
@@ -313,18 +442,33 @@ pub fn simulate_click_with_hold(target: ClickTarget, hold_duration: Duration) {
     simulate_click_responsive(target, hold_duration, None);
 }
 
-fn wait_double_click_interval(signal: Option<&WorkerSignal>) -> bool {
+#[inline]
+fn wait_responsive(
+    duration: Duration,
+    signal: Option<&WorkerSignal>,
+    timer: Option<&WaitableTimer>,
+) -> bool {
     if let Some(sig) = signal {
-        if !sig.running.load(Ordering::Acquire) {
-            return false;
-        }
-        let lock = sig.mutex.lock().unwrap();
-        let (new_lock, _) = sig.condvar.wait_timeout(lock, Duration::from_millis(15)).unwrap();
-        *new_lock && sig.running.load(Ordering::Acquire)
+        sig.wait_for_timer_or_wake(duration, timer)
     } else {
-        std::thread::sleep(Duration::from_millis(15));
+        std::thread::sleep(duration);
         true
     }
+}
+
+#[inline]
+fn send_key_press_and_release(
+    down: &INPUT,
+    up: &INPUT,
+    hold_duration: Duration,
+    signal: Option<&WorkerSignal>,
+    timer: Option<&WaitableTimer>,
+) {
+    send_inputs(std::slice::from_ref(down));
+    if hold_duration > Duration::ZERO {
+        let _ = wait_responsive(hold_duration, signal, timer);
+    }
+    send_inputs(std::slice::from_ref(up));
 }
 
 pub fn simulate_keyboard_click_precomputed(
@@ -333,57 +477,46 @@ pub fn simulate_keyboard_click_precomputed(
     click_type: ClickType,
     hold_duration: Duration,
     signal: Option<&WorkerSignal>,
+    timer: Option<&WaitableTimer>,
 ) {
-    unsafe {
-        match click_type {
-            ClickType::Single => {
-                SendInput(1, &down, std::mem::size_of::<INPUT>() as i32);
-                if hold_duration > Duration::ZERO {
-                    if let Some(sig) = signal {
-                        if sig.running.load(Ordering::Acquire) {
-                            let lock = sig.mutex.lock().unwrap();
-                            let _ = sig.condvar.wait_timeout(lock, hold_duration);
-                        }
-                    } else {
-                        std::thread::sleep(hold_duration);
-                    }
-                }
-                SendInput(1, &up, std::mem::size_of::<INPUT>() as i32);
+    match click_type {
+        ClickType::Single => {
+            send_key_press_and_release(&down, &up, hold_duration, signal, timer);
+        }
+        ClickType::Double => {
+            send_key_press_and_release(&down, &up, hold_duration, signal, timer);
+            if !wait_responsive(Duration::from_millis(15), signal, timer) {
+                return;
             }
-            ClickType::Double => {
-                SendInput(1, &down, std::mem::size_of::<INPUT>() as i32);
-                if hold_duration > Duration::ZERO {
-                    if let Some(sig) = signal {
-                        if sig.running.load(Ordering::Acquire) {
-                            let lock = sig.mutex.lock().unwrap();
-                            let _ = sig.condvar.wait_timeout(lock, hold_duration);
-                        }
-                    } else {
-                        std::thread::sleep(hold_duration);
-                    }
-                }
-                SendInput(1, &up, std::mem::size_of::<INPUT>() as i32);
+            send_key_press_and_release(&down, &up, hold_duration, signal, timer);
+        }
+        ClickType::Hold => {
+            send_inputs(std::slice::from_ref(&down));
+        }
+    }
+}
 
-                if !wait_double_click_interval(signal) {
-                    return;
-                }
-
-                SendInput(1, &down, std::mem::size_of::<INPUT>() as i32);
-                if hold_duration > Duration::ZERO {
-                    if let Some(sig) = signal {
-                        if sig.running.load(Ordering::Acquire) {
-                            let lock = sig.mutex.lock().unwrap();
-                            let _ = sig.condvar.wait_timeout(lock, hold_duration);
-                        }
-                    } else {
-                        std::thread::sleep(hold_duration);
-                    }
-                }
-                SendInput(1, &up, std::mem::size_of::<INPUT>() as i32);
+#[inline]
+fn simulate_mouse_click_precomputed(
+    inputs: &[INPUT; 2],
+    click_type: ClickType,
+    signal: Option<&WorkerSignal>,
+    timer: Option<&WaitableTimer>,
+) {
+    match click_type {
+        ClickType::Single => {
+            send_inputs(inputs);
+        }
+        ClickType::Double => {
+            send_inputs(inputs);
+            // Inter-click interval for Windows to recognize distinct double-click events
+            if !wait_responsive(Duration::from_millis(15), signal, timer) {
+                return;
             }
-            ClickType::Hold => {
-                SendInput(1, &down, std::mem::size_of::<INPUT>() as i32);
-            }
+            send_inputs(inputs);
+        }
+        ClickType::Hold => {
+            send_inputs(std::slice::from_ref(&inputs[0]));
         }
     }
 }
@@ -394,75 +527,22 @@ pub fn simulate_click_responsive(
     hold_duration: Duration,
     signal: Option<&WorkerSignal>,
 ) {
-    unsafe {
-        match target {
-            ClickTarget::Mouse(btn, click_type) => {
-                let (down_flag, up_flag) = match btn {
-                    MouseButton::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
-                    MouseButton::Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
-                    MouseButton::Middle => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
-                };
-
-                let make_inputs = || [
-                    INPUT {
-                        r#type: INPUT_MOUSE,
-                        Anonymous: INPUT_0 {
-                            mi: MOUSEINPUT {
-                                dx: 0,
-                                dy: 0,
-                                mouseData: 0,
-                                dwFlags: down_flag,
-                                time: 0,
-                                dwExtraInfo: 0,
-                            },
-                        },
-                    },
-                    INPUT {
-                        r#type: INPUT_MOUSE,
-                        Anonymous: INPUT_0 {
-                            mi: MOUSEINPUT {
-                                dx: 0,
-                                dy: 0,
-                                mouseData: 0,
-                                dwFlags: up_flag,
-                                time: 0,
-                                dwExtraInfo: 0,
-                            },
-                        },
-                    },
-                ];
-
-                match click_type {
-                    ClickType::Single => {
-                        let inputs = make_inputs();
-                        SendInput(2, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32);
-                    }
-                    ClickType::Double => {
-                        let inputs1 = make_inputs();
-                        SendInput(2, inputs1.as_ptr(), std::mem::size_of::<INPUT>() as i32);
-                        // Inter-click interval for Windows to recognize distinct double-click events
-                        if !wait_double_click_interval(signal) {
-                            return;
-                        }
-                        let inputs2 = make_inputs();
-                        SendInput(2, inputs2.as_ptr(), std::mem::size_of::<INPUT>() as i32);
-                    }
-                    ClickType::Hold => {
-                        press_target_down(target);
-                    }
-                }
-            }
-            ClickTarget::Keyboard(vk, click_type) => {
-                let down = create_keyboard_input(vk, false);
-                let up = create_keyboard_input(vk, true);
-                simulate_keyboard_click_precomputed(down, up, click_type, hold_duration, signal);
-            }
+    match target {
+        ClickTarget::Mouse(btn, click_type) => {
+            let (down_flag, up_flag) = mouse_button_flags(btn);
+            let inputs = [make_mouse_input(down_flag), make_mouse_input(up_flag)];
+            simulate_mouse_click_precomputed(&inputs, click_type, signal, None);
+        }
+        ClickTarget::Keyboard(vk, click_type) => {
+            let down = create_keyboard_input(vk, false);
+            let up = create_keyboard_input(vk, true);
+            simulate_keyboard_click_precomputed(down, up, click_type, hold_duration, signal, None);
         }
     }
 }
 
 /// Background worker loop that executes clicks with per-click drift compensation
-/// and a low-CPU hybrid wait (coarse condvar sleep + yield + microsecond spin-wait).
+/// and a low-CPU hybrid wait (high-resolution waitable timer + microsecond spin-wait).
 /// Halts immediately when signaled without waiting for the sleep duration to expire.
 pub fn run_worker_loop(
     hwnd_raw: isize,
@@ -471,29 +551,110 @@ pub fn run_worker_loop(
 ) {
     let hold_duration = calculate_key_hold_duration(config.interval);
     let sig = signal.clone();
-    let is_hold = matches!(
-        config.target,
-        ClickTarget::Mouse(_, ClickType::Hold) | ClickTarget::Keyboard(_, ClickType::Hold)
-    );
 
-    // Precompute keyboard input structs outside the loop so MapVirtualKeyW is not called on every tick
-    let kbd_inputs = match config.target {
-        ClickTarget::Keyboard(vk, _) => Some((
+    // Precompute INPUT structs outside the hot loop so MapVirtualKeyW / flag mapping is not repeated on every tick
+    enum PrecomputedTarget {
+        Mouse([INPUT; 2], ClickType),
+        Keyboard(INPUT, INPUT, ClickType),
+        HoldOnly,
+    }
+
+    let precomputed = match config.target {
+        ClickTarget::Mouse(_, ClickType::Hold) | ClickTarget::Keyboard(_, ClickType::Hold) => {
+            PrecomputedTarget::HoldOnly
+        }
+        ClickTarget::Mouse(btn, click_type) => {
+            let (down_flag, up_flag) = mouse_button_flags(btn);
+            PrecomputedTarget::Mouse(
+                [make_mouse_input(down_flag), make_mouse_input(up_flag)],
+                click_type,
+            )
+        }
+        ClickTarget::Keyboard(vk, click_type) => PrecomputedTarget::Keyboard(
             create_keyboard_input(vk, false),
             create_keyboard_input(vk, true),
-        )),
-        _ => None,
+            click_type,
+        ),
     };
 
-    run_worker_loop_internal(hwnd_raw, signal, config, move |target| {
-        if !is_hold {
-            if let (ClickTarget::Keyboard(_, click_type), Some((down, up))) = (target, kbd_inputs) {
-                simulate_keyboard_click_precomputed(down, up, click_type, hold_duration, Some(&sig));
-            } else {
-                simulate_click_responsive(target, hold_duration, Some(&sig));
+    run_worker_loop_internal_with_timer(hwnd_raw, signal, config, move |_, timer| {
+        match &precomputed {
+            PrecomputedTarget::Mouse(inputs, click_type) => {
+                simulate_mouse_click_precomputed(inputs, *click_type, Some(&sig), Some(timer));
             }
+            PrecomputedTarget::Keyboard(down, up, click_type) => {
+                simulate_keyboard_click_precomputed(
+                    *down,
+                    *up,
+                    *click_type,
+                    hold_duration,
+                    Some(&sig),
+                    Some(timer),
+                );
+            }
+            PrecomputedTarget::HoldOnly => {}
         }
     });
+}
+
+#[inline]
+fn notify_ui_stopped(hwnd_raw: isize, signal: &WorkerSignal) {
+    signal.stop();
+    if hwnd_raw != 0 {
+        unsafe {
+            PostMessageW(hwnd_raw as HWND, WM_APP_STOPPED, 0, 0);
+        }
+    }
+}
+
+#[inline]
+fn check_hold_hotkey_released(hwnd_raw: isize, signal: &WorkerSignal, config: &ClickerConfig) -> bool {
+    if config.trigger_mode == TriggerMode::Hold && config.hotkey > 0 {
+        let key_down = unsafe { (GetAsyncKeyState(config.hotkey as i32) as u16 & 0x8000) != 0 };
+        if !key_down {
+            notify_ui_stopped(hwnd_raw, signal);
+            return true;
+        }
+    }
+    false
+}
+
+#[inline]
+fn should_skip_self_click(hwnd_raw: isize, config: &ClickerConfig) -> bool {
+    if hwnd_raw == 0 {
+        return false;
+    }
+    let target_hwnd = hwnd_raw as HWND;
+    match config.target {
+        ClickTarget::Mouse(_, _) => {
+            let pt = match config.location {
+                MouseLocation::Specific(x, y) => POINT { x, y },
+                MouseLocation::Current => unsafe {
+                    let mut pt: POINT = std::mem::zeroed();
+                    GetCursorPos(&mut pt);
+                    pt
+                },
+            };
+
+            let left = WINDOW_RECT_LEFT.load(Ordering::Relaxed);
+            let top = WINDOW_RECT_TOP.load(Ordering::Relaxed);
+            let right = WINDOW_RECT_RIGHT.load(Ordering::Relaxed);
+            let bottom = WINDOW_RECT_BOTTOM.load(Ordering::Relaxed);
+
+            if pt.x >= left && pt.x < right && pt.y >= top && pt.y < bottom {
+                unsafe {
+                    let wnd = WindowFromPoint(pt);
+                    wnd == target_hwnd || GetAncestor(wnd, GA_ROOT) == target_hwnd
+                }
+            } else {
+                false
+            }
+        }
+        ClickTarget::Keyboard(_, _) => unsafe {
+            let foreground = GetForegroundWindow();
+            foreground == target_hwnd || GetAncestor(foreground, GA_ROOT) == target_hwnd
+        },
+    }
 }
 
 /// Internal loop implementation accepting a click callback, enabling precise unit testing
@@ -504,91 +665,86 @@ pub fn run_worker_loop_internal<F: FnMut(ClickTarget)>(
     config: ClickerConfig,
     mut click_fn: F,
 ) {
+    run_worker_loop_internal_with_timer(hwnd_raw, signal, config, move |target, _| {
+        click_fn(target);
+    });
+}
+
+fn run_worker_loop_internal_with_timer<F: FnMut(ClickTarget, &WaitableTimer)>(
+    hwnd_raw: isize,
+    signal: Arc<WorkerSignal>,
+    config: ClickerConfig,
+    mut click_fn: F,
+) {
     // Enable 1ms Windows timer resolution during clicking via RAII guard
     let _timer_guard = TimerResolutionGuard::new();
+    let timer = WaitableTimer::new();
 
     let is_hold = matches!(
         config.target,
         ClickTarget::Mouse(_, ClickType::Hold) | ClickTarget::Keyboard(_, ClickType::Hold)
     );
-    let mut is_target_held = false;
 
     // RAII guard guarantees any held mouse button or keyboard key is released when the worker halts
     struct ReleaseGuard {
         target: ClickTarget,
-        is_held: *mut bool,
+        is_held: bool,
     }
-    impl Drop for ReleaseGuard {
-        fn drop(&mut self) {
-            unsafe {
-                if !self.is_held.is_null() && *self.is_held {
-                    release_target(self.target);
-                    *self.is_held = false;
-                }
+    impl ReleaseGuard {
+        #[inline]
+        fn press(&mut self) {
+            if !self.is_held {
+                press_target_down(self.target);
+                self.is_held = true;
+            }
+        }
+        #[inline]
+        fn release(&mut self) {
+            if self.is_held {
+                release_target(self.target);
+                self.is_held = false;
             }
         }
     }
-    let _release_guard = ReleaseGuard {
+    impl Drop for ReleaseGuard {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    let mut release_guard = ReleaseGuard {
         target: config.target,
-        is_held: &mut is_target_held as *mut bool,
+        is_held: false,
     };
 
     let mut count: u64 = 0;
     let mut next_click_time = Instant::now();
     let mut was_paused = false;
 
-    // Immediately enforce mouse position if specific location is selected
-    if let MouseLocation::Specific(x, y) = config.location {
-        unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y);
-        }
-    }
-
     // Immediately press down target if Hold click type and NOT in HoldMouse mode
     if is_hold && config.trigger_mode != TriggerMode::HoldMouse {
-        if !is_target_held {
-            press_target_down(config.target);
-            is_target_held = true;
+        if let MouseLocation::Specific(x, y) = config.location {
+            unsafe {
+                SetCursorPos(x, y);
+            }
         }
+        release_guard.press();
     }
 
     while signal.running.load(Ordering::Relaxed) {
-        // In Hold trigger mode (Hotkey), monitor hotkey state from background thread
-        if config.trigger_mode == TriggerMode::Hold && config.hotkey > 0 {
-            let key_down = unsafe {
-                (GetAsyncKeyState(config.hotkey as i32) as u16 & 0x8000) != 0
-            };
-            if !key_down {
-                signal.running.store(false, Ordering::SeqCst);
-                if hwnd_raw != 0 {
-                    unsafe {
-                        PostMessageW(hwnd_raw as HWND, WM_APP_STOPPED, 0, 0);
-                    }
-                }
-                break;
-            }
+        if check_hold_hotkey_released(hwnd_raw, &signal, &config) {
+            break;
         }
 
         // In HoldMouse trigger mode, pause clicking while physical mouse button is not held down
         if config.trigger_mode == TriggerMode::HoldMouse {
             if !is_physical_mouse_down() {
                 if !was_paused {
-                    if is_target_held {
-                        release_target(config.target);
-                        is_target_held = false;
-                    }
+                    release_guard.release();
                     was_paused = true;
                 }
 
-                let lock = signal.mutex.lock().unwrap();
-                if !*lock || !signal.running.load(Ordering::Relaxed) {
-                    break;
-                }
-                let (new_lock, _) = signal
-                    .condvar
-                    .wait_timeout(lock, Duration::from_millis(15))
-                    .unwrap();
-                if !*new_lock || !signal.running.load(Ordering::Relaxed) {
+                if !signal.wait_while_paused() {
                     break;
                 }
                 continue;
@@ -598,9 +754,8 @@ pub fn run_worker_loop_internal<F: FnMut(ClickTarget)>(
             if was_paused {
                 was_paused = false;
                 next_click_time = Instant::now();
-                if is_hold && !is_target_held {
-                    press_target_down(config.target);
-                    is_target_held = true;
+                if is_hold {
+                    release_guard.press();
                 }
             }
         }
@@ -608,69 +763,19 @@ pub fn run_worker_loop_internal<F: FnMut(ClickTarget)>(
         // Enforce mouse position before evaluating target window and clicking
         if let MouseLocation::Specific(x, y) = config.location {
             unsafe {
-                windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y);
+                SetCursorPos(x, y);
             }
         }
 
-        // Prevent self-clicking / self-typing if Clickr's window is targeted
-        let skip = if hwnd_raw != 0 {
-            match config.target {
-                ClickTarget::Mouse(_, _) => {
-                    let pt = match config.location {
-                        MouseLocation::Specific(x, y) => windows_sys::Win32::Foundation::POINT { x, y },
-                        MouseLocation::Current => unsafe {
-                            let mut pt: windows_sys::Win32::Foundation::POINT = std::mem::zeroed();
-                            windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt);
-                            pt
-                        },
-                    };
-
-                    let left = WINDOW_RECT_LEFT.load(Ordering::Acquire);
-                    let top = WINDOW_RECT_TOP.load(Ordering::Acquire);
-                    let right = WINDOW_RECT_RIGHT.load(Ordering::Acquire);
-                    let bottom = WINDOW_RECT_BOTTOM.load(Ordering::Acquire);
-
-                    if pt.x >= left && pt.x < right && pt.y >= top && pt.y < bottom {
-                        unsafe {
-                            let wnd = windows_sys::Win32::UI::WindowsAndMessaging::WindowFromPoint(pt);
-                            let root = windows_sys::Win32::UI::WindowsAndMessaging::GetAncestor(
-                                wnd,
-                                windows_sys::Win32::UI::WindowsAndMessaging::GA_ROOT,
-                            );
-                            wnd == hwnd_raw as HWND || root == hwnd_raw as HWND
-                        }
-                    } else {
-                        false
-                    }
-                }
-                ClickTarget::Keyboard(_, _) => unsafe {
-                    let foreground = windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
-                    let root = windows_sys::Win32::UI::WindowsAndMessaging::GetAncestor(
-                        foreground,
-                        windows_sys::Win32::UI::WindowsAndMessaging::GA_ROOT,
-                    );
-                    foreground == hwnd_raw as HWND || root == hwnd_raw as HWND
-                },
+        if !should_skip_self_click(hwnd_raw, &config) {
+            if is_hold {
+                release_guard.press();
             }
-        } else {
-            false
-        };
-
-        if !skip {
-            if is_hold && !is_target_held {
-                press_target_down(config.target);
-                is_target_held = true;
-            }
-            click_fn(config.target);
+            click_fn(config.target, &timer);
             count += 1;
 
             if config.amount > 0 && count >= config.amount {
-                signal.running.store(false, Ordering::SeqCst);
-                if hwnd_raw != 0 {
-                    unsafe {
-                        PostMessageW(hwnd_raw as HWND, WM_APP_STOPPED, 0, 0);
-                    }
-                }
+                notify_ui_stopped(hwnd_raw, &signal);
                 break;
             }
         }
@@ -678,7 +783,7 @@ pub fn run_worker_loop_internal<F: FnMut(ClickTarget)>(
         // 1. Advance the target schedule by the exact interval
         next_click_time += config.interval;
 
-        // 2. Lag-Spike / Buffer Guard:
+        // 2. Lag-Spike / Buffer Guard
         let now = Instant::now();
         if now > next_click_time {
             let lag = now.duration_since(next_click_time);
@@ -688,30 +793,22 @@ pub fn run_worker_loop_internal<F: FnMut(ClickTarget)>(
             }
         }
 
-        // 3. Low-CPU Hybrid Wait for remaining time
+        // 3. Low-CPU Hybrid Wait for remaining time:
+        //    High-res waitable timer sleeps until ~150us before target; legacy timer falls back to 1ms margin.
+        let (spin_threshold, timer_margin) = if timer.is_high_res {
+            (Duration::from_micros(250), Duration::from_micros(150))
+        } else {
+            (Duration::from_micros(1500), Duration::from_micros(1000))
+        };
+
         while signal.running.load(Ordering::Relaxed) {
-            // Check hotkey in Hold trigger mode
-            if config.trigger_mode == TriggerMode::Hold && config.hotkey > 0 {
-                let key_down = unsafe {
-                    (GetAsyncKeyState(config.hotkey as i32) as u16 & 0x8000) != 0
-                };
-                if !key_down {
-                    signal.running.store(false, Ordering::SeqCst);
-                    if hwnd_raw != 0 {
-                        unsafe {
-                            PostMessageW(hwnd_raw as HWND, WM_APP_STOPPED, 0, 0);
-                        }
-                    }
-                    return;
-                }
+            if check_hold_hotkey_released(hwnd_raw, &signal, &config) {
+                return;
             }
 
             // In HoldMouse trigger mode: if mouse was released during wait, release target and break to pause
             if config.trigger_mode == TriggerMode::HoldMouse && !is_physical_mouse_down() {
-                if is_target_held {
-                    release_target(config.target);
-                    is_target_held = false;
-                }
+                release_guard.release();
                 was_paused = true;
                 break;
             }
@@ -723,27 +820,19 @@ pub fn run_worker_loop_internal<F: FnMut(ClickTarget)>(
 
             let remaining = next_click_time - current;
 
-            // Phase 1: Coarse responsive sleep while remaining > 1.5ms (0% CPU)
-            if remaining > Duration::from_micros(1500) {
-                let sleep_duration = (remaining - Duration::from_micros(1000)).max(Duration::from_millis(1));
-                // Clamp sleep step to at most 15ms if in Hold/HoldMouse trigger mode
-                let mut sleep_step = sleep_duration;
-                if config.trigger_mode == TriggerMode::Hold || config.trigger_mode == TriggerMode::HoldMouse {
+            if remaining > spin_threshold {
+                let mut sleep_step = remaining - timer_margin;
+                if config.trigger_mode == TriggerMode::Hold {
                     sleep_step = sleep_step.min(Duration::from_millis(15));
                 }
 
-                let lock = signal.mutex.lock().unwrap();
-                if !*lock || !signal.running.load(Ordering::Relaxed) {
-                    return;
-                }
-                let (new_lock, _) = signal.condvar.wait_timeout(lock, sleep_step).unwrap();
-                if !*new_lock || !signal.running.load(Ordering::Relaxed) {
+                if !signal.wait_for_timer_or_wake(sleep_step, Some(&timer)) {
                     return;
                 }
                 continue;
             }
 
-            // Phase 2: Lightweight CPU pause spin-wait for final sub-millisecond
+            // Lightweight CPU pause spin-wait for final sub-millisecond window
             std::hint::spin_loop();
         }
     }
@@ -1182,7 +1271,7 @@ mod tests {
 
         // 2. User holds down mouse click: verify it starts clicking
         set_physical_mouse_down(true);
-        signal.condvar.notify_all();
+        signal.notify();
         std::thread::sleep(Duration::from_millis(30));
         let count_after_down = click_count.load(Ordering::SeqCst);
         assert!(
@@ -1193,7 +1282,7 @@ mod tests {
 
         // 3. User releases mouse click: verify it pauses clicking
         set_physical_mouse_down(false);
-        signal.condvar.notify_all();
+        signal.notify();
         std::thread::sleep(Duration::from_millis(25));
         let count_after_release = click_count.load(Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(25));
@@ -1205,7 +1294,7 @@ mod tests {
 
         // 4. User holds down mouse click again: verify it resumes clicking
         set_physical_mouse_down(true);
-        signal.condvar.notify_all();
+        signal.notify();
         std::thread::sleep(Duration::from_millis(30));
         assert!(
             click_count.load(Ordering::SeqCst) > count_after_release,
